@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "prebuild": "node scripts/prepare-pages-data.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",

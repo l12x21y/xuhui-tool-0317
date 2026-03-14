@@ -76,6 +76,25 @@ export default function App() {
   const [roadNetworkData, setRoadNetworkData] = useState<RoadNetworkRecord[]>([]);
   const [roadGeoData, setRoadGeoData] = useState<RoadFeatureCollection | null>(null);
 
+  const dataUrl = (relativePath: string) => `${import.meta.env.BASE_URL}${relativePath.replace(/^\//, '')}`;
+  const fetchJsonWithFallback = async (apiPath: string, staticPath: string) => {
+    const staticUrl = dataUrl(staticPath);
+    const useStaticFirst = import.meta.env.PROD;
+
+    const primary = useStaticFirst ? staticUrl : apiPath;
+    const secondary = useStaticFirst ? apiPath : staticUrl;
+
+    let res = await fetch(primary);
+    if (!res.ok) {
+      res = await fetch(secondary);
+    }
+    return res;
+  };
+
+  const fetchTextFromBase = async (relativePath: string) => {
+    return fetch(dataUrl(relativePath));
+  };
+
   useEffect(() => {
     let interval: any;
     if (config.isSimulationActive) {
@@ -105,7 +124,7 @@ export default function App() {
     const fetchData = async () => {
       try {
         // Fetch boundary
-        const boundaryRes = await fetch('/api/data/boundary');
+        const boundaryRes = await fetchJsonWithFallback('/api/data/boundary', '/api/data/boundary.json');
         if (boundaryRes.ok) {
           let boundaryData = await boundaryRes.json();
           boundaryData = correctGeoJSON(boundaryData);
@@ -113,7 +132,7 @@ export default function App() {
         }
 
         // Fetch POI diversity
-        const poiRes = await fetch('/api/data/poi-diversity');
+        const poiRes = await fetchJsonWithFallback('/api/data/poi-diversity', '/api/data/poi-diversity.json');
         if (poiRes.ok) {
           let poiData = await poiRes.json();
           // Apply coordinate correction
@@ -170,7 +189,7 @@ export default function App() {
 
         // Fetch merged-area geojson if available
         try {
-          const mergedRes = await fetch('/api/data/merged-area');
+          const mergedRes = await fetchJsonWithFallback('/api/data/merged-area', '/api/data/merged-area.json');
           if (mergedRes.ok) {
             let mergedData = await mergedRes.json();
             // merged-area.geojson 已采用 CRS84 (WGS84 lon/lat)，
@@ -194,28 +213,28 @@ export default function App() {
   useEffect(() => {
     const fetchGridMetrics = async () => {
       try {
-        const hpRes = await fetch('/Xuhui_houseprice_grid_metrics.csv');
+        const hpRes = await fetchTextFromBase('/Xuhui_houseprice_grid_metrics.csv');
         if (hpRes.ok) {
           const text = await hpRes.text();
           const data = d3.csvParse(text);
           setHousePriceGridMetrics(data);
         }
 
-        const svRes = await fetch('/Xuhui_streetview_grid_metrics.csv');
+        const svRes = await fetchTextFromBase('/Xuhui_streetview_grid_metrics.csv');
         if (svRes.ok) {
           const text = await svRes.text();
           const data = d3.csvParse(text);
           setStreetViewGridMetrics(data);
         }
 
-        const actRes = await fetch('/Xuhui_activity_grid.csv');
+        const actRes = await fetchTextFromBase('/Xuhui_activity_grid.csv');
         if (actRes.ok) {
           const text = await actRes.text();
           const data = d3.csvParse(text);
           setActivityGridData(data);
         }
 
-        const roadRes = await fetch('/Xuhui_Road_Network_Data_Fixed.csv');
+        const roadRes = await fetchTextFromBase('/Xuhui_Road_Network_Data_Fixed.csv');
         if (roadRes.ok) {
           const text = await roadRes.text();
           const rows = d3.csvParseRows(text);
@@ -257,7 +276,7 @@ export default function App() {
           }
         }
 
-        const roadGeoRes = await fetch('/api/data/roads');
+        const roadGeoRes = await fetchJsonWithFallback('/api/data/roads', '/api/data/roads.json');
         if (roadGeoRes.ok) {
           const roadGeoJson = await roadGeoRes.json();
           if (Array.isArray(roadGeoJson?.features) && roadGeoJson.features.length > 0) {
