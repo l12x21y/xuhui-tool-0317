@@ -1,0 +1,5 @@
+{
+  "name": "Xuhui Grid Heat Simulator",
+  "description": "A simulation platform for Xuhui District to analyze and predict regional heat based on POI density and special events.",
+  "requestFramePermissions": []
+}
