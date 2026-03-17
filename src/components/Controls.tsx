@@ -95,7 +95,7 @@ export const Controls: React.FC<ControlsProps> = ({ config, setConfig, viewMode,
       finalEvent.gridId = '';
       finalEvent.radius = 0;
     } else if (draftEvent.gridId) {
-      const fullGridId = `grid-${draftEvent.gridId}`;
+      const fullGridId = draftEvent.gridId;
       const targetGrid = gridData?.find(g => g.id === fullGridId);
       if (targetGrid) {
         finalEvent.x = targetGrid.x;
@@ -622,7 +622,7 @@ export const Controls: React.FC<ControlsProps> = ({ config, setConfig, viewMode,
                 </div>
               </div>
               <div className="p-3 bg-orange-50 rounded-2xl border border-orange-100">
-                <p className="text-[10px] font-bold text-orange-600 uppercase mb-1">数据来源: Xuhui_houseprice_grid_metrics.csv</p>
+                <p className="text-[10px] font-bold text-orange-600 uppercase mb-1">数据来源: house_grid_100m_xh.csv</p>
                 <p className="text-[9px] text-orange-500 italic">分析房价空间分布及其与城市功能的相关性</p>
               </div>
             </div>
@@ -1372,10 +1372,10 @@ export const Controls: React.FC<ControlsProps> = ({ config, setConfig, viewMode,
                       <label>网格ID</label>
                       <input
                         type="text"
-                        value={event.gridId?.replace('grid-', '') || ''}
+                        value={event.gridId || ''}
                         onChange={(e) => {
                           const num = e.target.value.replace(/\D/g, '');
-                          const fullId = `grid-${num}`;
+                          const fullId = num;
                           const gridData = (window as any).currentGridData as GridData[];
                           const targetGrid = gridData?.find(g => g.id === fullId);
                           if (targetGrid) {

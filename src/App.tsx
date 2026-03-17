@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import * as d3 from 'd3';
-import { Map } from './components/Map';
+import { Map as GridMap } from './components/Map';
 import { Controls } from './components/Controls';
 import { GridData, SimulationConfig, POICategories, MainMode, RoadNetworkRecord, LocationAreaMode, RoadFeatureCollection } from './types';
 import { generateMockGrid, calculateTrafficHeat } from './services/simulation';
@@ -77,12 +77,18 @@ export default function App() {
   const [roadGeoData, setRoadGeoData] = useState<RoadFeatureCollection | null>(null);
 
   const dataUrl = (relativePath: string) => `${import.meta.env.BASE_URL}${relativePath.replace(/^\//, '')}`;
+  const pickMetricValue = (row: any, keys: string[], fallback = 0): number => {
+    if (!row) return fallback;
+    for (const key of keys) {
+      const v = parseFloat(row[key]);
+      if (Number.isFinite(v)) return v;
+    }
+    return fallback;
+  };
   const fetchJsonWithFallback = async (apiPath: string, staticPath: string) => {
     const staticUrl = dataUrl(staticPath);
-    const useStaticFirst = import.meta.env.PROD;
-
-    const primary = useStaticFirst ? staticUrl : apiPath;
-    const secondary = useStaticFirst ? apiPath : staticUrl;
+    const primary = apiPath; // always prefer API
+    const secondary = staticUrl; // static file as fallback
 
     let res = await fetch(primary);
     if (!res.ok) {
@@ -93,6 +99,73 @@ export default function App() {
 
   const fetchTextFromBase = async (relativePath: string) => {
     return fetch(dataUrl(relativePath));
+  };
+
+  const normalizeGridKey = (value: any): string => {
+    if (value === null || value === undefined) return '';
+    const raw = String(value).trim();
+    if (!raw) return '';
+    const num = Number(raw);
+    if (Number.isFinite(num)) return String(Math.trunc(num));
+    return raw;
+  };
+
+  const buildAlignedRows = (rows: any[], keyCandidates: string[]) => {
+    if (!gridData || gridData.length === 0) return [] as any[];
+    if (!rows || rows.length === 0) return gridData.map(() => ({}));
+
+    const idMap = new Map<string, any>();
+    const coordMap = new Map<string, any>();
+
+    for (const row of rows) {
+      for (const key of keyCandidates) {
+        const id = normalizeGridKey(row?.[key]);
+        if (id && !idMap.has(id)) {
+          idMap.set(id, row);
+          break;
+        }
+      }
+
+      const lon = parseFloat(row?.centroid_lon ?? row?.lon ?? row?.lng ?? 'NaN');
+      const lat = parseFloat(row?.centroid_lat ?? row?.lat ?? 'NaN');
+      if (Number.isFinite(lon) && Number.isFinite(lat)) {
+        coordMap.set(`${lon.toFixed(7)},${lat.toFixed(7)}`, row);
+      }
+    }
+
+    const byId = gridData.map((g) => {
+      const idCandidates = [
+        g.feature?.properties?.cell_id,
+        g.feature?.properties?.grid_id,
+        g.feature?.id,
+        g.id,
+      ];
+      for (const candidate of idCandidates) {
+        const key = normalizeGridKey(candidate);
+        if (key && idMap.has(key)) {
+          return idMap.get(key);
+        }
+      }
+      return null;
+    });
+
+    const idMatches = byId.filter(Boolean).length;
+    if (idMatches / gridData.length >= 0.2) {
+      return byId.map((r) => r || {});
+    }
+
+    const byCoord = gridData.map((g) => {
+      const lon = Number(g.x);
+      const lat = Number(g.y);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+      return coordMap.get(`${lon.toFixed(7)},${lat.toFixed(7)}`) || null;
+    });
+    const coordMatches = byCoord.filter(Boolean).length;
+    if (coordMatches / gridData.length >= 0.2) {
+      return byCoord.map((r) => r || {});
+    }
+
+    return gridData.map((_, i) => rows[i] || {});
   };
 
   useEffect(() => {
@@ -141,6 +214,9 @@ export default function App() {
           // Map features to GridData
           const mappedData: GridData[] = poiData.features.map((f: any, idx: number) => {
             const props = f.properties;
+            const canonicalId = normalizeGridKey(
+              props?.poi?.grid_id ?? props?.grid_id ?? props?.cell_id ?? f?.id ?? idx
+            ) || String(idx);
             
             // Handle both Point and Polygon geometries
             let x = 0;
@@ -160,9 +236,16 @@ export default function App() {
               x = d3.mean(allPoints, (d: any) => d[0]) || 0;
               y = d3.mean(allPoints, (d: any) => d[1]) || 0;
             }
+
+            const csvLon = Number(props?.poi?.centroid_lon ?? props?.centroid_lon);
+            const csvLat = Number(props?.poi?.centroid_lat ?? props?.centroid_lat);
+            if (Number.isFinite(csvLon) && Number.isFinite(csvLat)) {
+              x = csvLon;
+              y = csvLat;
+            }
             
             return {
-              id: `grid-${idx}`,
+              id: canonicalId,
               x: x,
               y: y,
               pois: {
@@ -210,31 +293,65 @@ export default function App() {
     fetchData();
   }, []);
 
+  // Align external CSV metrics to the gridData order so downstream
+  // analysis functions receive arrays matching `data` index order.
+  const alignedHousePriceMetrics = useMemo(() => {
+    return buildAlignedRows(housePriceGridMetrics, ['cell_id', 'cellId', 'grid_id', 'gridId', 'grid']);
+  }, [gridData, housePriceGridMetrics]);
+
+  const alignedActivityData = useMemo(() => {
+    return buildAlignedRows(activityGridData, ['grid_id', 'gridId', 'cell_id', 'cellId', 'id']);
+  }, [gridData, activityGridData]);
+
+  const alignedStreetViewMetrics = useMemo(() => {
+    return buildAlignedRows(streetViewGridMetrics, ['cell_id', 'cellId', 'grid_id', 'gridId', 'grid']);
+  }, [gridData, streetViewGridMetrics]);
+
   useEffect(() => {
     const fetchGridMetrics = async () => {
       try {
-        const hpRes = await fetchTextFromBase('/Xuhui_houseprice_grid_metrics.csv');
+        const hpRes = await fetch('/api/data/houseprice');
         if (hpRes.ok) {
           const text = await hpRes.text();
-          const data = d3.csvParse(text);
+          const rows = d3.csvParseRows(text).filter(row => row.length > 0);
+          let data: any[] = [];
+          if (rows.length > 1) {
+            const header = rows[0];
+            const hasCanonicalPriceHeader = header.some(h => {
+              const key = String(h || '').toLowerCase();
+              return key.includes('price') || key.includes('avg_price') || key.includes('house_price') || key.includes('小区均价');
+            });
+
+            if (hasCanonicalPriceHeader) {
+              data = d3.csvParse(text);
+            } else {
+              data = rows.slice(1).map((row, idx) => ({
+                grid_id: row[0] ?? String(idx),
+                house_price: parseFloat(row[1] ?? '0') || 0,
+                total_area: parseFloat(row[2] ?? '0') || 0,
+                plot_ratio: parseFloat(row[3] ?? '0') || 0,
+                green_ratio: parseFloat(row[4] ?? '0') || 0,
+              }));
+            }
+          }
           setHousePriceGridMetrics(data);
         }
 
-        const svRes = await fetchTextFromBase('/Xuhui_streetview_grid_metrics.csv');
+        const svRes = await fetch('/api/data/streetview');
         if (svRes.ok) {
           const text = await svRes.text();
           const data = d3.csvParse(text);
           setStreetViewGridMetrics(data);
         }
 
-        const actRes = await fetchTextFromBase('/Xuhui_activity_grid.csv');
+        const actRes = await fetch('/api/data/activity');
         if (actRes.ok) {
           const text = await actRes.text();
           const data = d3.csvParse(text);
           setActivityGridData(data);
         }
 
-        const roadRes = await fetchTextFromBase('/Xuhui_Road_Network_Data_Fixed.csv');
+        const roadRes = await fetch('/api/data/road-metrics');
         if (roadRes.ok) {
           const text = await roadRes.text();
           const rows = d3.csvParseRows(text);
@@ -365,7 +482,7 @@ export default function App() {
 
         {/* Map Area */}
         <div id="analysis-map-container" className="flex-1 relative min-h-0 flex flex-col bg-white">
-          <Map 
+          <GridMap 
             data={gridData} 
             config={config} 
             boundary={boundary}
@@ -373,9 +490,9 @@ export default function App() {
             restrictToBoundary={restrictToBoundary}
             roadNetworkData={roadNetworkData}
             roadGeoData={roadGeoData || undefined}
-            housePriceGridMetrics={housePriceGridMetrics}
-            streetViewGridMetrics={streetViewGridMetrics}
-            activityGridData={activityGridData}
+            housePriceGridMetrics={alignedHousePriceMetrics}
+            streetViewGridMetrics={alignedStreetViewMetrics}
+            activityGridData={alignedActivityData}
             onGridClick={handleGridClick}
             viewMode={viewMode}
             locationAreaMode={locationAreaMode}
@@ -444,35 +561,39 @@ export default function App() {
                       } else if (viewMode === 'dbscan') {
                         displayPois = allPois.filter(([key]) => config.dbscanCategories?.includes(key as keyof POICategories));
                       } else if (viewMode === 'house_price') {
-                        const idx = gridData.indexOf(selectedGrid);
-                        const metrics = housePriceGridMetrics[idx];
+                        const idx = gridData.findIndex(g => g.id === selectedGrid.id);
+                        const metrics = alignedHousePriceMetrics[idx];
                         if (!metrics) return <p className="text-[9px] text-slate-400 italic">暂无房价指标数据</p>;
+                        const hpPrice = pickMetricValue(metrics, ['小区均价', 'house_price', 'avg_price', 'price'], 0);
+                        const hpArea = pickMetricValue(metrics, ['总建面', 'total_area', 'area'], 0);
+                        const hpPlotRatio = pickMetricValue(metrics, ['容积率', 'plot_ratio', 'far'], 0);
+                        const hpGreenRatio = pickMetricValue(metrics, ['绿化率', 'green_ratio'], 0);
                         return (
                           <div className="p-3 bg-emerald-50 rounded-2xl border border-emerald-100 space-y-2">
                             <p className="text-[10px] font-bold text-emerald-600 uppercase">房价分析指标</p>
                             <div className="space-y-1">
                               <div className="flex justify-between text-[9px]">
                                 <span className="text-slate-500">小区均价:</span>
-                                <span className="font-bold text-emerald-700">{metrics['小区均价'] || '0'} 元/㎡</span>
+                                <span className="font-bold text-emerald-700">{hpPrice || '0'} 元/㎡</span>
                               </div>
                               <div className="flex justify-between text-[9px]">
                                 <span className="text-slate-500">总建面:</span>
-                                <span className="font-bold text-emerald-700">{metrics['总建面'] || '0'} ㎡</span>
+                                <span className="font-bold text-emerald-700">{hpArea || '0'} ㎡</span>
                               </div>
                               <div className="flex justify-between text-[9px]">
                                 <span className="text-slate-500">容积率:</span>
-                                <span className="font-bold text-emerald-700">{metrics['容积率'] || '0'}</span>
+                                <span className="font-bold text-emerald-700">{hpPlotRatio || '0'}</span>
                               </div>
                               <div className="flex justify-between text-[9px]">
                                 <span className="text-slate-500">绿化率:</span>
-                                <span className="font-bold text-emerald-700">{metrics['绿化率'] || '0'}%</span>
+                                <span className="font-bold text-emerald-700">{hpGreenRatio || '0'}%</span>
                               </div>
                             </div>
                           </div>
                         );
                       } else if (viewMode === 'street_view') {
-                        const idx = gridData.indexOf(selectedGrid);
-                        const metrics = streetViewGridMetrics[idx];
+                        const idx = gridData.findIndex(g => g.id === selectedGrid.id);
+                        const metrics = alignedStreetViewMetrics[idx];
                         if (!metrics) return <p className="text-[9px] text-slate-400 italic">暂无街景指标数据</p>;
                         return (
                           <div className="p-3 bg-cyan-50 rounded-2xl border border-cyan-100 space-y-2">
@@ -498,16 +619,17 @@ export default function App() {
                           </div>
                         );
                       } else if (viewMode === 'activity_analysis') {
-                        const idx = gridData.indexOf(selectedGrid);
-                        const metrics = activityGridData[idx];
+                        const idx = gridData.findIndex(g => g.id === selectedGrid.id);
+                        const metrics = alignedActivityData[idx];
                         if (!metrics) return <p className="text-[9px] text-slate-400 italic">暂无活动指标数据</p>;
+                        const activityCount = pickMetricValue(metrics, ['activity_count', 'activity_account', 'activity'], 0);
                         return (
                           <div className="p-3 bg-rose-50 rounded-2xl border border-rose-100 space-y-2">
                             <p className="text-[10px] font-bold text-rose-600 uppercase">城市活动指标</p>
                             <div className="space-y-1">
                               <div className="flex justify-between text-[9px]">
                                 <span className="text-slate-500">活动强度 (Count):</span>
-                                <span className="font-bold text-rose-700">{metrics.activity_count || '0'}</span>
+                                <span className="font-bold text-rose-700">{activityCount || '0'}</span>
                               </div>
                               <p className="text-[9px] text-slate-400 italic mt-2">
                                 数据来源于 Xuhui_activity_grid.csv，反映该网格内的历史活动频次。
@@ -522,7 +644,7 @@ export default function App() {
                         // Recompute traffic heat values for current data + road network (fast enough for single read)
                         const trafficValues = calculateTrafficHeat(gridData, roadNetworkData || []);
                         const trafficValue = trafficValues[idx] || 0;
-                        const streetMetrics = streetViewGridMetrics[idx] || {};
+                        const streetMetrics = alignedStreetViewMetrics[idx] || {};
 
                         return (
                           <div className="p-3 bg-indigo-50 rounded-2xl border border-indigo-100 space-y-2">
@@ -552,9 +674,9 @@ export default function App() {
                         const minRatio = config.regionSelectionMinRatio ?? 0.01;
                         const { values: regionValues, idealRanges } = calculateRegionSelection(
                           gridData,
-                          activityGridData,
-                          housePriceGridMetrics,
-                          streetViewGridMetrics,
+                          alignedActivityData,
+                          alignedHousePriceMetrics,
+                          alignedStreetViewMetrics,
                           threshold
                         );
 
@@ -565,9 +687,9 @@ export default function App() {
                         const ratioThreshold = Number(sorted[rankIdx] ?? threshold);
                         const effectiveThreshold = selectedCount >= minCount ? threshold : Math.min(threshold, ratioThreshold);
 
-                        const houseMetrics = housePriceGridMetrics[idx] || {};
-                        const streetMetrics = streetViewGridMetrics[idx] || {};
-                        const activityMetrics = activityGridData[idx] || {};
+                        const houseMetrics = alignedHousePriceMetrics[idx] || {};
+                        const streetMetrics = alignedStreetViewMetrics[idx] || {};
+                        const activityMetrics = alignedActivityData[idx] || {};
                         const currentValues: Record<string, number> = {
                           poi_density: d3.sum(Object.values(selectedGrid.pois)),
                           traffic_poi: selectedGrid.pois.JTSS || 0,
@@ -576,7 +698,7 @@ export default function App() {
                           sky_view: parseFloat(streetMetrics.sky_view || 'NaN'),
                           continuity: parseFloat(streetMetrics.interface_continuity || 'NaN'),
                           walkability: parseFloat(streetMetrics.walkability || 'NaN'),
-                          house_price: parseFloat(houseMetrics['小区均价'] || 'NaN')
+                          house_price: pickMetricValue(houseMetrics, ['小区均价', 'house_price', 'avg_price', 'price'], NaN)
                         };
 
                         const labelMap: Record<string, string> = {
@@ -623,7 +745,7 @@ export default function App() {
                                 );
                               })}
                             </div>
-                            <div className="text-[9px] text-slate-400 italic">activity: {activityMetrics.activity_count || '0'}</div>
+                            <div className="text-[9px] text-slate-400 italic">activity: {pickMetricValue(activityMetrics, ['activity_count', 'activity_account', 'activity'], 0)}</div>
                           </div>
                         );
                       }

@@ -1,6 +1,15 @@
 import { GridData, SimulationConfig, POICategories } from "../types";
 import * as d3 from 'd3';
 
+function getNumeric(row: any, keys: string[], fallback = 0): number {
+  if (!row) return fallback;
+  for (const key of keys) {
+    const value = parseFloat(row[key]);
+    if (Number.isFinite(value)) return value;
+  }
+  return fallback;
+}
+
 /**
  * Calculates the average POI count for each category across all grid cells.
  */
@@ -689,10 +698,10 @@ export function calculateHousePriceAnalysis(data: GridData[], config: Simulation
   
   // Use grid metrics if available for specific sub-modes
   if (gridMetrics && gridMetrics.length > 0) {
-    if (subMode === 'price') return gridMetrics.map(m => parseFloat(m['小区均价'] || 0));
-    if (subMode === 'area') return gridMetrics.map(m => parseFloat(m['总建面'] || 0));
-    if (subMode === 'plot_ratio') return gridMetrics.map(m => parseFloat(m['容积率'] || 0));
-    if (subMode === 'green_ratio') return gridMetrics.map(m => parseFloat(m['绿化率'] || 0));
+    if (subMode === 'price') return gridMetrics.map(m => getNumeric(m, ['小区均价', 'house_price', 'avg_price', 'price'], 0));
+    if (subMode === 'area') return gridMetrics.map(m => getNumeric(m, ['总建面', 'total_area', 'area'], 0));
+    if (subMode === 'plot_ratio') return gridMetrics.map(m => getNumeric(m, ['容积率', 'plot_ratio', 'far'], 0));
+    if (subMode === 'green_ratio') return gridMetrics.map(m => getNumeric(m, ['绿化率', 'green_ratio'], 0));
   }
 
   return data.map(() => 0);
@@ -722,7 +731,7 @@ export function calculateStreetViewAnalysis(data: GridData[], config: Simulation
  */
 export function calculateActivityAnalysis(data: GridData[], config: SimulationConfig, activityGridData: any[]): number[] {
   if (!activityGridData || activityGridData.length === 0) return data.map(() => 0);
-  return activityGridData.map(m => parseFloat(m.activity_count || 0));
+  return activityGridData.map(m => getNumeric(m, ['activity_count', 'activity_account', 'activity'], 0));
 }
 
 /**
@@ -741,9 +750,13 @@ export function calculateFactorImportance(
   
   return data.map((d, i) => {
     const poiDensity = d3.sum(Object.values(d.pois));
-    const housePrice = housePriceMetrics && housePriceMetrics[i] ? parseFloat(housePriceMetrics[i]['小区均价'] || 0) : 0;
+    const housePrice = housePriceMetrics && housePriceMetrics[i]
+      ? getNumeric(housePriceMetrics[i], ['小区均价', 'house_price', 'avg_price', 'price'], 0)
+      : 0;
     const greenView = streetViewMetrics && streetViewMetrics[i] ? parseFloat(streetViewMetrics[i].green_view || 0) : 0;
-    const activity = activityData && activityData[i] ? parseFloat(activityData[i].activity_count || 0) : 0;
+    const activity = activityData && activityData[i]
+      ? getNumeric(activityData[i], ['activity_count', 'activity_account', 'activity'], 0)
+      : 0;
     
     // Normalize values for mock calculations
     const nPoi = Math.min(1, poiDensity / 50);
@@ -827,7 +840,9 @@ export function calculateRegionSelection(
   const activeIndices = data
     .map((_, i) => i)
     .filter(i => {
-      const activity = activityData && activityData[i] ? parseFloat(activityData[i].activity_count || 0) : 0;
+      const activity = activityData && activityData[i]
+        ? getNumeric(activityData[i], ['activity_count', 'activity_account', 'activity'], 0)
+        : 0;
       return Number.isFinite(activity) && activity > 0;
     });
 
@@ -842,7 +857,9 @@ export function calculateRegionSelection(
 
     if (featureKey === 'poi_density') return d3.sum(Object.values(grid.pois));
     if (featureKey === 'traffic_poi') return grid.pois.JTSS || 0;
-    if (featureKey === 'house_price') return house ? parseFloat(house['小区均价'] || 0) : null;
+    if (featureKey === 'house_price') {
+      return house ? getNumeric(house, ['小区均价', 'house_price', 'avg_price', 'price'], 0) : null;
+    }
     if (featureKey === 'green_view') return street ? parseFloat(street.green_view || 0) : null;
     if (featureKey === 'sky_view') return street ? parseFloat(street.sky_view || 0) : null;
     if (featureKey === 'continuity') return street ? parseFloat(street.interface_continuity || 0) : null;

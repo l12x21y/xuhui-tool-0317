@@ -53,12 +53,143 @@ async function buildBoundary() {
 }
 
 async function buildPoiDiversity() {
-  const shp = path.join(rootDir, 'Xuhui_POI_diversity.shp');
-  const dbf = path.join(rootDir, 'Xuhui_POI_diversity.dbf');
   const out = path.join(outputDir, 'poi-diversity.json');
 
+  // Prefer existing JSON/GeoJSON source files (in repo or public), then fallback to SHP
+  const candidates = [
+    path.join(rootDir, 'public', 'api', 'data', 'poi-diversity.json'),
+    path.join(rootDir, 'poi-diversity.json'),
+  ];
+
+  // If there is a POI CSV for the 100m grid, prefer merging it with the grid geojson
+  const poiCsv = path.join(rootDir, 'xuhui_100m_poi.csv');
+  const gridGeo = path.join(rootDir, 'grid_100m_xh.geojson');
+
+  if (fs.existsSync(poiCsv) && fs.existsSync(gridGeo)) {
+    const gridRaw = await fs.promises.readFile(gridGeo, 'utf-8');
+    const gridJson = JSON.parse(gridRaw);
+
+    const csvBuffer = await fs.promises.readFile(poiCsv);
+    let csvRaw = '';
+    try {
+      csvRaw = new TextDecoder('gbk').decode(csvBuffer);
+    } catch {
+      csvRaw = csvBuffer.toString('utf-8');
+    }
+
+    const lines = csvRaw.split(/\r?\n/).filter(Boolean);
+    if (lines.length <= 1) {
+      throw new Error('POI CSV is empty');
+    }
+    lines.shift();
+
+    const toNum = (v) => {
+      const n = Number((v ?? '').toString().trim());
+      return Number.isFinite(n) ? n : 0;
+    };
+
+    // 列位约定（用户提供格式）：
+    // 0:grid_id 1:centroid_lon 2:centroid_lat
+    // 3~30 为 14类POI与其 _1 列交替，31:diversity
+    const csvMap = new Map();
+    for (const line of lines) {
+      const cols = line.split(',');
+      if (cols.length < 32) continue;
+      const gridId = String((cols[0] || '').trim());
+      if (!gridId) continue;
+
+      const row = {
+        grid_id: gridId,
+        centroid_lon: toNum(cols[1]),
+        centroid_lat: toNum(cols[2]),
+
+        JTSS: toNum(cols[3]),
+        JTSS_1: toNum(cols[4]),
+        SHFW: toNum(cols[5]),
+        SHFW_1: toNum(cols[6]),
+        GSQY: toNum(cols[7]),
+        GSQY_1: toNum(cols[8]),
+        QCXG: toNum(cols[9]),
+        QCXG_1: toNum(cols[10]),
+        SWZZ: toNum(cols[11]),
+        SWZZ_1: toNum(cols[12]),
+        XXYL: toNum(cols[13]),
+        XXYL_1: toNum(cols[14]),
+        JDZS: toNum(cols[15]),
+        JDZS_1: toNum(cols[16]),
+        CYMS: toNum(cols[17]),
+        CYMS_1: toNum(cols[18]),
+        GWXF: toNum(cols[19]),
+        GWXF_1: toNum(cols[20]),
+        KJWH: toNum(cols[21]),
+        KJWH_1: toNum(cols[22]),
+        YLBJ: toNum(cols[23]),
+        YLBJ_1: toNum(cols[24]),
+        LYJD: toNum(cols[25]),
+        LYJD_1: toNum(cols[26]),
+        YDJS: toNum(cols[27]),
+        YDJS_1: toNum(cols[28]),
+        JRJG: toNum(cols[29]),
+        JRJG_1: toNum(cols[30]),
+        diversity: toNum(cols[31]),
+      };
+
+      csvMap.set(gridId, row);
+    }
+
+    // Merge CSV rows into grid features under properties.poi
+    if (Array.isArray(gridJson.features)) {
+      for (const feat of gridJson.features) {
+        const cell = feat?.properties?.cell_id ?? feat?.properties?.id ?? feat?.id;
+        const key = String(cell);
+        feat.properties = feat.properties || {};
+        if (csvMap.has(key)) {
+          const row = csvMap.get(key);
+          feat.properties.poi = row;
+          feat.properties.centroid_lon = row.centroid_lon;
+          feat.properties.centroid_lat = row.centroid_lat;
+          feat.properties.JTSS = row.JTSS;
+          feat.properties.SHFW = row.SHFW;
+          feat.properties.GSQY = row.GSQY;
+          feat.properties.QCXG = row.QCXG;
+          feat.properties.SWZZ = row.SWZZ;
+          feat.properties.XXYL = row.XXYL;
+          feat.properties.JDZS = row.JDZS;
+          feat.properties.CYMS = row.CYMS;
+          feat.properties.GWXF = row.GWXF;
+          feat.properties.KJWH = row.KJWH;
+          feat.properties.YLBJ = row.YLBJ;
+          feat.properties.LYJD = row.LYJD;
+          feat.properties.YDJS = row.YDJS;
+          feat.properties.JRJG = row.JRJG;
+          feat.properties.diversity = row.diversity;
+        } else {
+          feat.properties.poi = null;
+        }
+      }
+    }
+
+    await writeJson(out, gridJson);
+    console.log(`generated: ${path.relative(rootDir, out)} (merged from ${path.relative(rootDir, gridGeo)} + ${path.relative(rootDir, poiCsv)})`);
+    return;
+  }
+
+  // Next prefer existing JSON/GeoJSON source files (in repo or public), then fallback to grid file
+  for (const src of candidates.concat([path.join(rootDir, 'grid_100m_xh.geojson')])) {
+    if (fs.existsSync(src)) {
+      const raw = await fs.promises.readFile(src, 'utf-8');
+      const parsed = JSON.parse(raw);
+      await writeJson(out, parsed);
+      console.log(`generated: ${path.relative(rootDir, out)} (from ${path.relative(rootDir, src)})`);
+      return;
+    }
+  }
+
+  // Fallback to shapefile if no geojson/json candidate found
+  const shp = path.join(rootDir, 'Xuhui_POI_diversity.shp');
+  const dbf = path.join(rootDir, 'Xuhui_POI_diversity.dbf');
   if (!fs.existsSync(shp) || !fs.existsSync(dbf)) {
-    throw new Error('POI diversity source files not found');
+    throw new Error('POI diversity source files not found (checked geojson/json and shp)');
   }
 
   const geojson = await readShapefileAsGeoJSON(shp, dbf);
@@ -121,10 +252,11 @@ async function buildMergedAreaIfExists() {
 
 async function copyCsvAssets() {
   const csvFiles = [
-    'Xuhui_houseprice_grid_metrics.csv',
+    'house_grid_100m_xh.csv',
     'Xuhui_streetview_grid_metrics.csv',
     'Xuhui_activity_grid.csv',
     'Xuhui_Road_Network_Data_Fixed.csv',
+    'xuhui_100m_poi.csv',
   ];
 
   for (const fileName of csvFiles) {
