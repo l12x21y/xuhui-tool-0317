@@ -1,21 +1,40 @@
-export type MainMode = 
-  | 'location_analysis' | 'traffic_analysis' | 'heat' | 'kde' | 'house_price' | 'street_view' | 'activity_analysis' 
-  | 'spatial_autocorrelation' | 'entropy' | 'dbscan' | 'space_syntax' | 'factor_importance'
-  | 'flow_analysis' | 'region_selection';
+export type ScopeArea = 'xuhui' | 'greater_xujiahui';
 
-export type LocationAreaMode = 'xuhui' | 'greater_xujiahui';
+export type VisualizationMode =
+  | 'location'
+  | 'traffic'
+  | 'heat'
+  | 'kde'
+  | 'house_price'
+  | 'street_view'
+  | 'activity';
 
-export type HeatSubMode = 'single' | 'multi' | 'simulation';
-export type FlowSubMode = 'custom_formula' | 'ml_driven';
-export type SpatialSubMode = 'moran' | 'lisa';
-export type SpaceSyntaxSubMode = 'connectivity' | 'integration' | 'choice';
-export type HousePriceSubMode = 'price' | 'area' | 'plot_ratio' | 'green_ratio';
-export type StreetViewSubMode = 'green_view' | 'sky_view' | 'continuity' | 'walkability' | 'traffic' | 'activity';
-export type ActivitySubMode = 'distribution' | 'density';
-export type FactorSubMode = 'importance' | 'linear' | 'rf' | 'gwr';
-export type TrafficSubMode = 'heat' | 'network';
+export type AnalysisMode =
+  | 'spatial_autocorrelation'
+  | 'mix_degree'
+  | 'cluster_identification'
+  | 'space_syntax';
 
-export type ViewMode = MainMode | HeatSubMode | FlowSubMode | SpatialSubMode | SpaceSyntaxSubMode | HousePriceSubMode | StreetViewSubMode | ActivitySubMode | FactorSubMode | TrafficSubMode | keyof POICategories;
+export type FactorMode = 'grid_score' | 'factor_correlation';
+
+export type PredictionMode = 'flow_prediction';
+
+export type MainMode = VisualizationMode | AnalysisMode | FactorMode | PredictionMode;
+
+export type HeatMode = 'single' | 'multi' | 'overall';
+
+export type FactorBusinessCategory =
+  | 'ACGN'
+  | 'Auto'
+  | 'F&B'
+  | 'Public'
+  | 'Star'
+  | 'Lifestyle'
+  | 'Beauty'
+  | 'Culture&Art'
+  | 'Overall';
+
+export type ViewMode = MainMode | HeatMode | keyof POICategories;
 
 export interface POICategories {
   CYMS: number; // 餐饮美食
@@ -45,35 +64,26 @@ export interface GridData {
 
 export interface SimulationConfig {
   weights: Record<keyof POICategories, number>;
-  customFormula: {
-    traffic: number;
-    commercial: number;
-    purchasing: number;
-    youth: number;
-  };
   events: EventData[];
-  multiFactorCategories?: (keyof POICategories)[];
-  kdeCategories?: (keyof POICategories)[];
-  flowCategories?: (keyof POICategories)[];
-  aggregationCategories?: (keyof POICategories)[];
-  moranCategories?: (keyof POICategories)[];
-  lisaCategories?: (keyof POICategories)[];
-  entropyCategories?: (keyof POICategories)[];
-  dbscanCategories?: (keyof POICategories)[];
+  multiFactorCategories: (keyof POICategories)[];
   singleFactorCategory?: keyof POICategories;
-  heatSubMode: HeatSubMode;
-  flowSubMode: FlowSubMode;
-  spatialSubMode: SpatialSubMode;
-  spaceSyntaxSubMode: SpaceSyntaxSubMode;
-  housePriceSubMode: HousePriceSubMode;
-  streetViewSubMode: StreetViewSubMode;
-  activitySubMode: ActivitySubMode;
-  factorSubMode: FactorSubMode;
-  trafficSubMode?: TrafficSubMode;
+  heatMode: HeatMode;
+  analysisCategory: keyof POICategories;
+  factorBusinessCategory: FactorBusinessCategory;
+  flowBusinessCategory: FactorBusinessCategory;
+  flowSelectedGridIds: string[];
+  flowRadiusMeters: number;
+  flowSelectedFactor: string;
+  flowDelta: number;
+  flowCurrentMonth: number;
+  flowCurrentWeekday: number;
+  flowDraftMonths: number[];
+  flowDraftWeekdays: number[];
+  flowTimeBoost: number;
+  flowChanges: FlowChange[];
   isSimulationActive: boolean;
   simulationStep: number;
-  regionSelectionThreshold?: number;
-  regionSelectionMinRatio?: number;
+  flowDurationDays: number;
 }
 
 export const POI_LABELS: Record<string, string> = {
@@ -96,31 +106,49 @@ export const POI_LABELS: Record<string, string> = {
 export interface EventData {
   id: string;
   name: string;
-  x: number;
-  y: number;
-  radius: number;
+  gridId: string;
+  category: keyof POICategories;
   intensity: number;
-  gridId?: string;
-  category?: keyof POICategories;
-  scope?: 'grid' | 'global' | 'region';
-  effect?: 'add' | 'percent';
-  gridRange?: number;
 }
 
-export interface RoadNetworkRecord {
-  startNodeId: string;
-  endNodeId: string;
-  roadName: string;
-  functionalClass: string;
-  direction: string;
-  lanes: string;
-  length: number;
-  speed: number;
-  osmTag: string;
-  flowScore: number;
+export interface GridMetricRow {
+  [key: string]: string | number | undefined;
 }
 
-export interface RoadFeatureCollection {
-  type: 'FeatureCollection';
-  features: any[];
+export interface FlowChange {
+  id: string;
+  businessCategory: FactorBusinessCategory;
+  factor: string;
+  gridIds: string[];
+  radiusMeters: number;
+  delta: number;
+  activeMonths: number[];
+  activeWeekdays: number[];
+  timeBoost: number;
 }
+
+export interface TemporalCategoryWeights {
+  totalEvents: number;
+  avgDurationDays: number;
+  categoryWeight: number;
+  categoryMultiplier: number;
+  monthWeights: Record<string, number>;
+  weekdayWeights: Record<string, number>;
+  monthMultipliers: Record<string, number>;
+  weekdayMultipliers: Record<string, number>;
+}
+
+export interface TemporalWeightsPayload {
+  formula: Record<string, string>;
+  meta: {
+    source: string;
+    sheets: string[];
+    categories: string[];
+    allTotalEvents: number;
+  };
+  weightsByCategory: Record<Exclude<FactorBusinessCategory, 'Overall'>, TemporalCategoryWeights>;
+}
+
+export type ImportanceWeightsByCategory = Record<FactorBusinessCategory, Record<string, number>>;
+
+export type AttractionBaselineByCategory = Record<FactorBusinessCategory, Record<string, number>>;

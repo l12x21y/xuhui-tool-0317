@@ -1,775 +1,844 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import * as d3 from 'd3';
-import { Map as GridMap } from './components/Map';
-import { Controls } from './components/Controls';
-import { GridData, SimulationConfig, POICategories, MainMode, RoadNetworkRecord, LocationAreaMode, RoadFeatureCollection } from './types';
-import { generateMockGrid, calculateTrafficHeat } from './services/simulation';
-import { calculateRegionSelection } from './services/simulation';
-import { Map as MapIcon, Info, Activity, Layers, Zap } from 'lucide-react';
+import { Map as MapIcon } from 'lucide-react';
+import { domToCanvas } from 'modern-screenshot';
 import { motion } from 'motion/react';
-import { correctGeoJSON } from './utils/coords';
+import { Controls } from './components/Controls';
+import { Map as AnalysisMap } from './components/Map';
+import {
+  FactorBusinessCategory,
+  AttractionBaselineByCategory,
+  GridData,
+  GridMetricRow,
+  ImportanceWeightsByCategory,
+  MainMode,
+  POI_LABELS,
+  POICategories,
+  SimulationConfig,
+  TemporalWeightsPayload,
+} from './types';
+import { getModeScope } from './services/simulation';
+import { correctGeoJSON, ensureLonLatGeoJSON, gcj02ToWgs84 } from './utils/coords';
 
-const POI_LABELS: Record<string, string> = {
-  CYMS: '餐饮美食',
-  GSQY: '公司企业',
-  GWXF: '购物消费',
-  JTSS: '交通设施',
-  JRJG: '金融机构',
-  JDZS: '酒店住宿',
-  KJWH: '科教文化',
-  LYJD: '旅游景点',
-  QCXG: '汽车相关',
-  SWZZ: '商务住宅',
-  SHFW: '生活服务',
-  XXYL: '休闲娱乐',
-  YLBJ: '医疗保健',
-  YDJS: '运动健身'
+const defaultWeights: Record<keyof POICategories, number> = {
+  CYMS: 1,
+  GSQY: 1,
+  GWXF: 1,
+  JTSS: 1,
+  JRJG: 1,
+  JDZS: 1,
+  KJWH: 1,
+  LYJD: 1,
+  QCXG: 1,
+  SWZZ: 1,
+  SHFW: 1,
+  XXYL: 1,
+  YLBJ: 1,
+  YDJS: 1,
+};
+
+const modeLabels: Record<MainMode, string> = {
+  location: '区位分析',
+  traffic: '交通分析',
+  heat: '热力分析',
+  kde: '核密度分析',
+  house_price: '房价分析',
+  street_view: '街景分析',
+  activity: '活动分析',
+  spatial_autocorrelation: '空间自相关',
+  mix_degree: '混合度分析',
+  cluster_identification: '聚类识别',
+  space_syntax: '空间句法',
+  grid_score: '网格打分',
+  factor_correlation: '因子关联分析',
+  flow_prediction: '人流预测模拟',
+};
+
+const SIMULATION_DURATION_MAX_DAYS = 90;
+const now = new Date();
+const CURRENT_MONTH = now.getMonth() + 1;
+const CURRENT_WEEKDAY = now.getDay() === 0 ? 7 : now.getDay();
+
+const parseNumeric = (value: unknown, fallback = 0): number => {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+};
+
+const normalizeId = (value: unknown) => {
+  if (value === null || value === undefined) return '';
+  const raw = String(value).trim();
+  if (!raw) return '';
+  const num = Number(raw);
+  return Number.isFinite(num) ? String(Math.trunc(num)) : raw;
+};
+
+const POI_KEYS = Object.keys(defaultWeights) as (keyof POICategories)[];
+
+const FACTOR_CATEGORIES: FactorBusinessCategory[] = [
+  'ACGN',
+  'Auto',
+  'F&B',
+  'Public',
+  'Star',
+  'Lifestyle',
+  'Beauty',
+  'Culture&Art',
+  'Overall',
+];
+
+const EMPTY_IMPORTANCE: ImportanceWeightsByCategory = {
+  ACGN: {},
+  Auto: {},
+  'F&B': {},
+  Public: {},
+  Star: {},
+  Lifestyle: {},
+  Beauty: {},
+  'Culture&Art': {},
+  Overall: {},
+};
+
+const EMPTY_ATTRACTION: AttractionBaselineByCategory = {
+  ACGN: {},
+  Auto: {},
+  'F&B': {},
+  Public: {},
+  Star: {},
+  Lifestyle: {},
+  Beauty: {},
+  'Culture&Art': {},
+  Overall: {},
+};
+
+const OVERALL_BASELINE_WEIGHTS: Record<Exclude<FactorBusinessCategory, 'Overall'>, number> = {
+  ACGN: 0.1,
+  Auto: 0.08,
+  'F&B': 0.22,
+  Public: 0.16,
+  Star: 0.1,
+  Lifestyle: 0.16,
+  Beauty: 0.09,
+  'Culture&Art': 0.09,
+};
+
+const buildEmptyPois = (): POICategories => ({
+  CYMS: 0,
+  GSQY: 0,
+  GWXF: 0,
+  JTSS: 0,
+  JRJG: 0,
+  JDZS: 0,
+  KJWH: 0,
+  LYJD: 0,
+  QCXG: 0,
+  SWZZ: 0,
+  SHFW: 0,
+  XXYL: 0,
+  YLBJ: 0,
+  YDJS: 0,
+});
+
+const parsePoiRows = (csvText: string) => {
+  const rows = d3.csvParseRows(csvText).filter((row) => row.length >= 32);
+  if (rows.length <= 1) return new Map<string, any>();
+
+  const header = rows[0];
+  const body = rows.slice(1);
+  const hasCanonicalKeys = header.some((item) => POI_KEYS.includes(String(item).trim() as keyof POICategories));
+
+  const poiById = new Map<string, any>();
+
+  if (hasCanonicalKeys) {
+    const parsed = d3.csvParse(csvText);
+    for (const row of parsed) {
+      const key = normalizeId(row.grid_id ?? row.cell_id ?? row.id);
+      if (key) poiById.set(key, row);
+    }
+    return poiById;
+  }
+
+  for (const row of body) {
+    const key = normalizeId(row[0]);
+    if (!key) continue;
+
+    const baseValue = (baseIndex: number) => parseNumeric(row[baseIndex], 0);
+
+    poiById.set(key, {
+      grid_id: key,
+      centroid_lon: row[1],
+      centroid_lat: row[2],
+      JTSS: baseValue(3),
+      SHFW: baseValue(5),
+      GSQY: baseValue(7),
+      QCXG: baseValue(9),
+      SWZZ: baseValue(11),
+      XXYL: baseValue(13),
+      JDZS: baseValue(15),
+      CYMS: baseValue(17),
+      GWXF: baseValue(19),
+      KJWH: baseValue(21),
+      YLBJ: baseValue(23),
+      LYJD: baseValue(25),
+      YDJS: baseValue(27),
+      JRJG: baseValue(29),
+      diversity: parseNumeric(row[31], 0),
+    });
+  }
+
+  return poiById;
+};
+
+const parseImportanceCsv = (csvText: string) => {
+  if (!csvText) return {} as Record<string, number>;
+  const rows = d3.csvParse(csvText);
+  const result: Record<string, number> = {};
+  for (const row of rows) {
+    const feature = String(row.feature || '').trim();
+    const importance = parseNumeric(row.importance, Number.NaN);
+    if (!feature || !Number.isFinite(importance)) continue;
+    result[feature] = importance;
+  }
+  return result;
+};
+
+const parseAttractionCsv = (csvText: string) => {
+  if (!csvText) return {} as Record<string, number>;
+  const rows = d3.csvParse(csvText);
+  const result: Record<string, number> = {};
+  for (const row of rows) {
+    const gridId = normalizeId(row.grid_id ?? row.cell_id ?? row.id);
+    const value = parseNumeric(row.A_original ?? row.A ?? row.baseline, Number.NaN);
+    if (!gridId || !Number.isFinite(value)) continue;
+    result[gridId] = value;
+  }
+  return result;
+};
+
+const buildOverallAttraction = (byCategory: AttractionBaselineByCategory) => {
+  const ids = new Set<string>();
+  (Object.keys(OVERALL_BASELINE_WEIGHTS) as Array<Exclude<FactorBusinessCategory, 'Overall'>>).forEach((category) => {
+    Object.keys(byCategory[category] || {}).forEach((id) => ids.add(id));
+  });
+
+  const overall: Record<string, number> = {};
+  ids.forEach((id) => {
+    let weightedSum = 0;
+    let weightSum = 0;
+
+    (Object.keys(OVERALL_BASELINE_WEIGHTS) as Array<Exclude<FactorBusinessCategory, 'Overall'>>).forEach((category) => {
+      const value = byCategory[category]?.[id];
+      if (!Number.isFinite(value)) return;
+      const w = OVERALL_BASELINE_WEIGHTS[category];
+      weightedSum += value * w;
+      weightSum += w;
+    });
+
+    overall[id] = weightSum > 0 ? weightedSum / weightSum : 0;
+  });
+
+  return overall;
+};
+
+const clonePoiMap = (source: Map<string, any>) => {
+  const target = new Map<string, any>();
+  source.forEach((row, key) => {
+    target.set(key, { ...row });
+  });
+  return target;
+};
+
+const correctPoiCentroids = (source: Map<string, any>) => {
+  const target = clonePoiMap(source);
+  target.forEach((row) => {
+    const lon = parseNumeric(row.centroid_lon, Number.NaN);
+    const lat = parseNumeric(row.centroid_lat, Number.NaN);
+    if (Number.isFinite(lon) && Number.isFinite(lat)) {
+      const [lonWgs, latWgs] = gcj02ToWgs84(lon, lat);
+      row.centroid_lon = lonWgs;
+      row.centroid_lat = latWgs;
+    }
+  });
+  return target;
+};
+
+const geoPoiAlignmentScore = (gridGeo: any, poiMap: Map<string, any>) => {
+  const features = gridGeo?.features || [];
+  if (features.length === 0 || poiMap.size === 0) return Number.POSITIVE_INFINITY;
+
+  const distances: number[] = [];
+
+  for (const feature of features) {
+    const id = normalizeId(feature?.properties?.cell_id ?? feature?.properties?.grid_id ?? feature?.id);
+    if (!id || !poiMap.has(id)) continue;
+
+    const row = poiMap.get(id);
+    const lon = parseNumeric(row?.centroid_lon, Number.NaN);
+    const lat = parseNumeric(row?.centroid_lat, Number.NaN);
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+
+    try {
+      const centroid = d3.geoCentroid(feature);
+      const dx = centroid[0] - lon;
+      const dy = centroid[1] - lat;
+      distances.push(Math.sqrt(dx * dx + dy * dy));
+    } catch {
+    }
+  }
+
+  if (distances.length === 0) return Number.POSITIVE_INFINITY;
+  distances.sort((a, b) => a - b);
+  const median = distances[Math.floor(distances.length / 2)];
+  return median;
+};
+
+const estimatePoiOffset = (gridGeo: any, poiMap: Map<string, any>) => {
+  const features = gridGeo?.features || [];
+  const dx: number[] = [];
+  const dy: number[] = [];
+
+  for (const feature of features) {
+    const id = normalizeId(feature?.properties?.cell_id ?? feature?.properties?.grid_id ?? feature?.id);
+    if (!id || !poiMap.has(id)) continue;
+    const row = poiMap.get(id);
+    const lon = parseNumeric(row?.centroid_lon, Number.NaN);
+    const lat = parseNumeric(row?.centroid_lat, Number.NaN);
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+
+    try {
+      const centroid = d3.geoCentroid(feature);
+      dx.push(centroid[0] - lon);
+      dy.push(centroid[1] - lat);
+    } catch {
+    }
+  }
+
+  if (dx.length < 10 || dy.length < 10) {
+    return { dx: 0, dy: 0, count: 0 };
+  }
+
+  dx.sort((a, b) => a - b);
+  dy.sort((a, b) => a - b);
+  const mid = Math.floor(dx.length / 2);
+  return {
+    dx: dx[mid],
+    dy: dy[mid],
+    count: dx.length,
+  };
+};
+
+const applyPoiOffset = (source: Map<string, any>, offsetX: number, offsetY: number) => {
+  const target = clonePoiMap(source);
+  target.forEach((row) => {
+    const lon = parseNumeric(row.centroid_lon, Number.NaN);
+    const lat = parseNumeric(row.centroid_lat, Number.NaN);
+    if (Number.isFinite(lon) && Number.isFinite(lat)) {
+      row.centroid_lon = lon + offsetX;
+      row.centroid_lat = lat + offsetY;
+    }
+  });
+  return target;
+};
+
+const normalizeFeatureCollection = (geo: any) => {
+  if (!geo) return null;
+  if (geo.type === 'FeatureCollection') return geo;
+  if (geo.type === 'Feature') return { type: 'FeatureCollection', features: [geo] };
+  return null;
+};
+
+const evaluateBoundaryCoverage = (boundary: any, grids: GridData[]) => {
+  const collection = normalizeFeatureCollection(boundary);
+  if (!collection || !Array.isArray(collection.features) || collection.features.length === 0) return 0;
+  if (grids.length === 0) return 0;
+
+  let hit = 0;
+  for (const grid of grids) {
+    try {
+      const centroid = d3.geoCentroid(grid.feature);
+      if (d3.geoContains(collection as any, centroid)) {
+        hit += 1;
+      }
+    } catch {
+    }
+  }
+  return hit / grids.length;
+};
+
+const pickAlignedBoundary = (rawBoundary: any, grids: GridData[], allowGcjCorrection = true) => {
+  if (!rawBoundary) return null;
+  const lonLat = ensureLonLatGeoJSON(rawBoundary);
+  if (!allowGcjCorrection) return lonLat;
+  const corrected = correctGeoJSON(lonLat);
+
+  const rawScore = evaluateBoundaryCoverage(lonLat, grids);
+  const correctedScore = evaluateBoundaryCoverage(corrected, grids);
+
+  return correctedScore >= rawScore ? corrected : lonLat;
+};
+
+const getGeoBoundsCenter = (geo: any): [number, number] | null => {
+  const collection = normalizeFeatureCollection(geo);
+  if (!collection || !Array.isArray(collection.features) || collection.features.length === 0) return null;
+  try {
+    const [[minLng, minLat], [maxLng, maxLat]] = d3.geoBounds(collection as any);
+    if (![minLng, minLat, maxLng, maxLat].every(Number.isFinite)) return null;
+    return [(minLng + maxLng) / 2, (minLat + maxLat) / 2];
+  } catch {
+    return null;
+  }
+};
+
+const getGeoCentroidSafe = (geo: any): [number, number] | null => {
+  const collection = normalizeFeatureCollection(geo);
+  if (!collection || !Array.isArray(collection.features) || collection.features.length === 0) return null;
+  try {
+    const [lng, lat] = d3.geoCentroid(collection as any);
+    if ([lng, lat].every(Number.isFinite)) return [lng, lat];
+  } catch {
+  }
+  return getGeoBoundsCenter(collection);
+};
+
+const toFeatureCollectionFromGrids = (grids: GridData[]) => ({
+  type: 'FeatureCollection',
+  features: grids.map((item) => item.feature).filter(Boolean),
+});
+
+const estimateBoundaryCenterOffset = (boundary: any, grids: GridData[]) => {
+  if (!boundary || grids.length === 0) return { dx: 0, dy: 0, count: 0 };
+  const boundaryCenter = getGeoCentroidSafe(boundary);
+  if (!boundaryCenter) return { dx: 0, dy: 0, count: 0 };
+
+  const gridCollection = toFeatureCollectionFromGrids(grids);
+  const gridCenter = getGeoCentroidSafe(gridCollection);
+  if (!gridCenter) return { dx: 0, dy: 0, count: 0 };
+
+  return {
+    dx: gridCenter[0] - boundaryCenter[0],
+    dy: gridCenter[1] - boundaryCenter[1],
+    count: grids.length,
+  };
+};
+
+const optimizeBoundaryOffsetByCoverage = (
+  boundary: any,
+  grids: GridData[],
+  initialDx: number,
+  initialDy: number
+) => {
+  const evalScore = (dx: number, dy: number) => {
+    const shifted = shiftFeatureCollection(boundary, dx, dy);
+    return evaluateBoundaryCoverage(shifted, grids);
+  };
+
+  let bestDx = initialDx;
+  let bestDy = initialDy;
+  let bestScore = evalScore(bestDx, bestDy);
+
+  const steps = [0.002, 0.001, 0.0005, 0.0002, 0.0001];
+  for (const step of steps) {
+    let improved = true;
+    while (improved) {
+      improved = false;
+      const baseDx = bestDx;
+      const baseDy = bestDy;
+
+      for (const ox of [-step, 0, step]) {
+        for (const oy of [-step, 0, step]) {
+          const candDx = baseDx + ox;
+          const candDy = baseDy + oy;
+          const candScore = evalScore(candDx, candDy);
+          if (candScore > bestScore + 1e-9) {
+            bestScore = candScore;
+            bestDx = candDx;
+            bestDy = candDy;
+            improved = true;
+          }
+        }
+      }
+    }
+  }
+
+  return { dx: bestDx, dy: bestDy, score: bestScore };
+};
+
+const shiftCoordinates = (coordinates: any, dx: number, dy: number): any => {
+  if (!Array.isArray(coordinates)) return coordinates;
+  if (coordinates.length >= 2 && typeof coordinates[0] === 'number' && typeof coordinates[1] === 'number') {
+    return [coordinates[0] + dx, coordinates[1] + dy];
+  }
+  return coordinates.map((item) => shiftCoordinates(item, dx, dy));
+};
+
+const shiftFeatureCollection = (geo: any, dx: number, dy: number) => {
+  const collection = normalizeFeatureCollection(geo);
+  if (!collection) return geo;
+  return {
+    ...collection,
+    features: (collection.features || []).map((feature: any) => ({
+      ...feature,
+      geometry: feature?.geometry
+        ? {
+            ...feature.geometry,
+            coordinates: shiftCoordinates(feature.geometry.coordinates, dx, dy),
+          }
+        : feature?.geometry,
+    })),
+  };
+};
+
+const buildGridData = (gridGeo: any, poiById: Map<string, any>) => {
+  return (gridGeo.features || []).map((feature: any, index: number) => {
+    const props = feature?.properties || {};
+    const id = normalizeId(props.cell_id ?? props.grid_id ?? feature.id ?? index) || String(index);
+    const poi = poiById.get(id) || {};
+
+    const centroid = d3.geoCentroid(feature);
+    const x = centroid[0];
+    const y = centroid[1];
+
+    const pois = buildEmptyPois();
+    for (const key of POI_KEYS) {
+      pois[key] = parseNumeric(poi[key], parseNumeric(props[key], 0));
+    }
+
+    const baseHeat = POI_KEYS.reduce((sum, key) => sum + pois[key], 0);
+
+    return {
+      id,
+      x,
+      y,
+      pois,
+      baseHeat,
+      feature,
+    };
+  });
 };
 
 export default function App() {
-  const [gridData, setGridData] = useState<GridData[]>([]);
-  const [boundary, setBoundary] = useState<any>(null);
-  const [viewMode, setViewMode] = useState<MainMode>('heat');
-  const [locationAreaMode, setLocationAreaMode] = useState<LocationAreaMode>('xuhui');
+  const [viewMode, setViewMode] = useState<MainMode>('location');
   const [config, setConfig] = useState<SimulationConfig>({
-    weights: {
-      CYMS: 1.0, GSQY: 1.0, GWXF: 1.0, JTSS: 1.0, JRJG: 1.0,
-      JDZS: 1.0, KJWH: 1.0, LYJD: 1.0, QCXG: 1.0, SWZZ: 1.0,
-      SHFW: 1.0, XXYL: 1.0, YLBJ: 1.0, YDJS: 1.0
-    },
-    customFormula: {
-      traffic: 1.0,
-      commercial: 1.0,
-      purchasing: 1.0,
-      youth: 1.0
-    },
+    weights: defaultWeights,
     events: [],
-    multiFactorCategories: ['CYMS', 'GWXF', 'XXYL'],
-    kdeCategories: ['CYMS'],
-    flowCategories: ['CYMS', 'JTSS'],
-    aggregationCategories: ['CYMS', 'GWXF'],
-    moranCategories: ['CYMS'],
-    lisaCategories: ['CYMS'],
-    entropyCategories: ['CYMS', 'GWXF', 'SHFW', 'KJWH', 'XXYL'],
-    dbscanCategories: ['CYMS'],
-    heatSubMode: 'simulation',
-    flowSubMode: 'custom_formula',
-    spatialSubMode: 'moran',
-    spaceSyntaxSubMode: 'connectivity',
-    housePriceSubMode: 'price',
-    streetViewSubMode: 'green_view',
-    activitySubMode: 'distribution',
-    trafficSubMode: 'heat',
-    factorSubMode: 'importance',
+    multiFactorCategories: ['CYMS', 'GWXF', 'SHFW'],
+    singleFactorCategory: 'CYMS',
+    heatMode: 'overall',
+    analysisCategory: 'CYMS',
+    factorBusinessCategory: 'Overall',
+    flowBusinessCategory: 'Overall',
+    flowSelectedGridIds: [],
+    flowRadiusMeters: 600,
+    flowSelectedFactor: '',
+    flowDelta: 30,
+    flowCurrentMonth: CURRENT_MONTH,
+    flowCurrentWeekday: CURRENT_WEEKDAY,
+    flowDraftMonths: [],
+    flowDraftWeekdays: [],
+    flowTimeBoost: 1.2,
+    flowChanges: [],
     isSimulationActive: false,
     simulationStep: 0,
-    singleFactorCategory: 'CYMS',
-    regionSelectionThreshold: 52,
-    regionSelectionMinRatio: 0.01
+    flowDurationDays: 7,
   });
-  const [mergedArea, setMergedArea] = useState<any>(null);
+
+  const [xuhuiGridData, setXuhuiGridData] = useState<GridData[]>([]);
+  const [dxjhGridData, setDxjhGridData] = useState<GridData[]>([]);
+  const [xuhuiBoundary, setXuhuiBoundary] = useState<any>(null);
+  const [dxjhBoundary, setDxjhBoundary] = useState<any>(null);
+  const [housePriceRows, setHousePriceRows] = useState<GridMetricRow[]>([]);
+  const [streetViewRows, setStreetViewRows] = useState<GridMetricRow[]>([]);
+  const [dxjhMetricRows, setDxjhMetricRows] = useState<GridMetricRow[]>([]);
+  const [importanceByCategory, setImportanceByCategory] = useState<ImportanceWeightsByCategory>(EMPTY_IMPORTANCE);
+  const [attractionByCategory, setAttractionByCategory] = useState<AttractionBaselineByCategory>(EMPTY_ATTRACTION);
+  const [temporalWeights, setTemporalWeights] = useState<TemporalWeightsPayload | null>(null);
   const [selectedGrid, setSelectedGrid] = useState<GridData | null>(null);
-  const [restrictToBoundary, setRestrictToBoundary] = useState<boolean>(false);
-  const [housePriceGridMetrics, setHousePriceGridMetrics] = useState<any[]>([]);
-  const [streetViewGridMetrics, setStreetViewGridMetrics] = useState<any[]>([]);
-  const [activityGridData, setActivityGridData] = useState<any[]>([]);
-  const [roadNetworkData, setRoadNetworkData] = useState<RoadNetworkRecord[]>([]);
-  const [roadGeoData, setRoadGeoData] = useState<RoadFeatureCollection | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
 
-  const dataUrl = (relativePath: string) => `${import.meta.env.BASE_URL}${relativePath.replace(/^\//, '')}`;
-  const pickMetricValue = (row: any, keys: string[], fallback = 0): number => {
-    if (!row) return fallback;
-    for (const key of keys) {
-      const v = parseFloat(row[key]);
-      if (Number.isFinite(v)) return v;
-    }
-    return fallback;
-  };
-  const fetchJsonWithFallback = async (apiPath: string, staticPath: string) => {
-    const staticUrl = dataUrl(staticPath);
-    const primary = apiPath; // always prefer API
-    const secondary = staticUrl; // static file as fallback
-
-    let res = await fetch(primary);
-    if (!res.ok) {
-      res = await fetch(secondary);
-    }
-    return res;
-  };
-
-  const fetchTextFromBase = async (relativePath: string) => {
-    return fetch(dataUrl(relativePath));
-  };
-
-  const normalizeGridKey = (value: any): string => {
-    if (value === null || value === undefined) return '';
-    const raw = String(value).trim();
-    if (!raw) return '';
-    const num = Number(raw);
-    if (Number.isFinite(num)) return String(Math.trunc(num));
-    return raw;
-  };
-
-  const buildAlignedRows = (rows: any[], keyCandidates: string[]) => {
-    if (!gridData || gridData.length === 0) return [] as any[];
-    if (!rows || rows.length === 0) return gridData.map(() => ({}));
-
-    const idMap = new Map<string, any>();
-    const coordMap = new Map<string, any>();
-
-    for (const row of rows) {
-      for (const key of keyCandidates) {
-        const id = normalizeGridKey(row?.[key]);
-        if (id && !idMap.has(id)) {
-          idMap.set(id, row);
-          break;
-        }
-      }
-
-      const lon = parseFloat(row?.centroid_lon ?? row?.lon ?? row?.lng ?? 'NaN');
-      const lat = parseFloat(row?.centroid_lat ?? row?.lat ?? 'NaN');
-      if (Number.isFinite(lon) && Number.isFinite(lat)) {
-        coordMap.set(`${lon.toFixed(7)},${lat.toFixed(7)}`, row);
-      }
-    }
-
-    const byId = gridData.map((g) => {
-      const idCandidates = [
-        g.feature?.properties?.cell_id,
-        g.feature?.properties?.grid_id,
-        g.feature?.id,
-        g.id,
-      ];
-      for (const candidate of idCandidates) {
-        const key = normalizeGridKey(candidate);
-        if (key && idMap.has(key)) {
-          return idMap.get(key);
-        }
-      }
-      return null;
-    });
-
-    const idMatches = byId.filter(Boolean).length;
-    if (idMatches / gridData.length >= 0.2) {
-      return byId.map((r) => r || {});
-    }
-
-    const byCoord = gridData.map((g) => {
-      const lon = Number(g.x);
-      const lat = Number(g.y);
-      if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
-      return coordMap.get(`${lon.toFixed(7)},${lat.toFixed(7)}`) || null;
-    });
-    const coordMatches = byCoord.filter(Boolean).length;
-    if (coordMatches / gridData.length >= 0.2) {
-      return byCoord.map((r) => r || {});
-    }
-
-    return gridData.map((_, i) => rows[i] || {});
-  };
+  const scope = getModeScope(viewMode);
+  const forceDxjhModes: MainMode[] = ['grid_score', 'factor_correlation', 'flow_prediction'];
+  const usingDxjhBoundary = scope === 'greater_xujiahui' || forceDxjhModes.includes(viewMode);
+  const activeBoundary = usingDxjhBoundary ? dxjhBoundary : xuhuiBoundary;
+  const activeGridData = usingDxjhBoundary ? dxjhGridData : xuhuiGridData;
 
   useEffect(() => {
-    let interval: any;
-    if (config.isSimulationActive) {
-      // Reset to 0 when starting
-      setConfig(prev => ({ ...prev, simulationStep: 0 }));
-      
-      interval = setInterval(() => {
-        setConfig(prev => {
-          const nextStep = prev.simulationStep + 1;
-          if (nextStep > 10) {
-            return { ...prev, simulationStep: 0 };
-          }
-          return { ...prev, simulationStep: nextStep };
-        });
-      }, 400); // Slightly faster for smoother feel
-    } else {
-      setConfig(prev => ({ ...prev, simulationStep: 0 }));
-    }
-    return () => clearInterval(interval);
+    if (!config.isSimulationActive) return;
+    const timer = setInterval(() => {
+      setConfig((prev) => {
+        const maxDays = Math.max(1, Math.min(SIMULATION_DURATION_MAX_DAYS, Math.round(prev.flowDurationDays || 1)));
+        if (prev.simulationStep >= maxDays) {
+          return { ...prev, isSimulationActive: false };
+        }
+        return { ...prev, simulationStep: prev.simulationStep + 1 };
+      });
+    }, 500);
+    return () => clearInterval(timer);
   }, [config.isSimulationActive]);
 
-  const handleGridClick = (grid: GridData) => {
-    setSelectedGrid(prev => prev?.id === grid.id ? null : grid);
-  };
+  useEffect(() => {
+    if (!selectedGrid) return;
+    const exists = activeGridData.some((item) => item.id === selectedGrid.id);
+    if (!exists) {
+      setSelectedGrid(null);
+    }
+  }, [activeGridData, selectedGrid]);
 
   useEffect(() => {
-    const fetchData = async () => {
+    const fetchJsonSafe = async (url: string) => {
       try {
-        // Fetch boundary
-        const boundaryRes = await fetchJsonWithFallback('/api/data/boundary', '/api/data/boundary.json');
-        if (boundaryRes.ok) {
-          let boundaryData = await boundaryRes.json();
-          boundaryData = correctGeoJSON(boundaryData);
-          setBoundary(boundaryData);
-        }
-
-        // Fetch POI diversity
-        const poiRes = await fetchJsonWithFallback('/api/data/poi-diversity', '/api/data/poi-diversity.json');
-        if (poiRes.ok) {
-          let poiData = await poiRes.json();
-          // Apply coordinate correction
-          poiData = correctGeoJSON(poiData);
-          
-          // Map features to GridData
-          const mappedData: GridData[] = poiData.features.map((f: any, idx: number) => {
-            const props = f.properties;
-            const canonicalId = normalizeGridKey(
-              props?.poi?.grid_id ?? props?.grid_id ?? props?.cell_id ?? f?.id ?? idx
-            ) || String(idx);
-            
-            // Handle both Point and Polygon geometries
-            let x = 0;
-            let y = 0;
-            
-            if (f.geometry.type === 'Point') {
-              x = f.geometry.coordinates[0];
-              y = f.geometry.coordinates[1];
-            } else if (f.geometry.type === 'Polygon') {
-              // Average coordinates of the outer ring
-              const ring = f.geometry.coordinates[0];
-              x = d3.mean(ring, (d: any) => d[0]) || 0;
-              y = d3.mean(ring, (d: any) => d[1]) || 0;
-            } else if (f.geometry.type === 'MultiPolygon') {
-              // Average all coordinates from all polygons
-              const allPoints = f.geometry.coordinates.flat(2);
-              x = d3.mean(allPoints, (d: any) => d[0]) || 0;
-              y = d3.mean(allPoints, (d: any) => d[1]) || 0;
-            }
-
-            const csvLon = Number(props?.poi?.centroid_lon ?? props?.centroid_lon);
-            const csvLat = Number(props?.poi?.centroid_lat ?? props?.centroid_lat);
-            if (Number.isFinite(csvLon) && Number.isFinite(csvLat)) {
-              x = csvLon;
-              y = csvLat;
-            }
-            
-            return {
-              id: canonicalId,
-              x: x,
-              y: y,
-              pois: {
-                CYMS: props.CYMS || 0,
-                GSQY: props.GSQY || 0,
-                GWXF: props.GWXF || 0,
-                JTSS: props.JTSS || 0,
-                JRJG: props.JRJG || 0,
-                JDZS: props.JDZS || 0,
-                KJWH: props.KJWH || 0,
-                LYJD: props.LYJD || 0,
-                QCXG: props.QCXG || 0,
-                SWZZ: props.SWZZ || 0,
-                SHFW: props.SHFW || 0,
-                XXYL: props.XXYL || 0,
-                YLBJ: props.YLBJ || 0,
-                YDJS: props.YDJS || 0
-              },
-              baseHeat: props.diversity || 0,
-              feature: f
-            };
-          });
-          setGridData(mappedData);
-
-        // Fetch merged-area geojson if available
-        try {
-          const mergedRes = await fetchJsonWithFallback('/api/data/merged-area', '/api/data/merged-area.json');
-          if (mergedRes.ok) {
-            let mergedData = await mergedRes.json();
-            // merged-area.geojson 已采用 CRS84 (WGS84 lon/lat)，
-            // 不对其执行地理坐标纠偏以避免坐标被错误平移。
-            setMergedArea(mergedData);
-          }
-        } catch (err) {
-          // ignore
-        }
-        }
-      } catch (error) {
-        console.error('Error fetching data:', error);
-        const mockData = generateMockGrid(30, 30);
-        setGridData(mockData);
+        const response = await fetch(url);
+        if (!response.ok) return null;
+        return response.json();
+      } catch {
+        return null;
       }
     };
 
-    fetchData();
-  }, []);
-
-  // Align external CSV metrics to the gridData order so downstream
-  // analysis functions receive arrays matching `data` index order.
-  const alignedHousePriceMetrics = useMemo(() => {
-    return buildAlignedRows(housePriceGridMetrics, ['cell_id', 'cellId', 'grid_id', 'gridId', 'grid']);
-  }, [gridData, housePriceGridMetrics]);
-
-  const alignedActivityData = useMemo(() => {
-    return buildAlignedRows(activityGridData, ['grid_id', 'gridId', 'cell_id', 'cellId', 'id']);
-  }, [gridData, activityGridData]);
-
-  const alignedStreetViewMetrics = useMemo(() => {
-    return buildAlignedRows(streetViewGridMetrics, ['cell_id', 'cellId', 'grid_id', 'gridId', 'grid']);
-  }, [gridData, streetViewGridMetrics]);
-
-  useEffect(() => {
-    const fetchGridMetrics = async () => {
+    const fetchTextSafe = async (url: string) => {
       try {
-        const hpRes = await fetch('/api/data/houseprice');
-        if (hpRes.ok) {
-          const text = await hpRes.text();
-          const rows = d3.csvParseRows(text).filter(row => row.length > 0);
-          let data: any[] = [];
-          if (rows.length > 1) {
-            const header = rows[0];
-            const hasCanonicalPriceHeader = header.some(h => {
-              const key = String(h || '').toLowerCase();
-              return key.includes('price') || key.includes('avg_price') || key.includes('house_price') || key.includes('小区均价');
-            });
-
-            if (hasCanonicalPriceHeader) {
-              data = d3.csvParse(text);
-            } else {
-              data = rows.slice(1).map((row, idx) => ({
-                grid_id: row[0] ?? String(idx),
-                house_price: parseFloat(row[1] ?? '0') || 0,
-                total_area: parseFloat(row[2] ?? '0') || 0,
-                plot_ratio: parseFloat(row[3] ?? '0') || 0,
-                green_ratio: parseFloat(row[4] ?? '0') || 0,
-              }));
-            }
-          }
-          setHousePriceGridMetrics(data);
-        }
-
-        const svRes = await fetch('/api/data/streetview');
-        if (svRes.ok) {
-          const text = await svRes.text();
-          const data = d3.csvParse(text);
-          setStreetViewGridMetrics(data);
-        }
-
-        const actRes = await fetch('/api/data/activity');
-        if (actRes.ok) {
-          const text = await actRes.text();
-          const data = d3.csvParse(text);
-          setActivityGridData(data);
-        }
-
-        const roadRes = await fetch('/api/data/road-metrics');
-        if (roadRes.ok) {
-          const text = await roadRes.text();
-          const rows = d3.csvParseRows(text);
-          if (rows.length > 1) {
-            const body = rows.slice(1);
-            const parsed: RoadNetworkRecord[] = body.map((row, idx) => {
-              const startNodeId = row[0] || '';
-              const endNodeId = row[1] || '';
-              const roadName = row[2] || '';
-              const functionalClass = (row[3] || row[8] || 'unknown').toString();
-              const direction = (row[4] || '').toString();
-              const lanes = (row[5] || '').toString();
-              const length = parseFloat(row[6] || '0') || 0;
-              const speed = parseFloat(row[7] || '0') || 0;
-              const osmTag = (row[8] || '').toString();
-
-              const laneNums = lanes
-                .split('/')
-                .map(v => parseFloat(v))
-                .filter(v => Number.isFinite(v) && v > 0);
-              const laneCount = laneNums.length > 0 ? d3.mean(laneNums)! : 1;
-              const directionWeight = direction.includes('双') ? 1.2 : direction.includes('单') ? 1.0 : 0.9;
-              const flowScore = laneCount * directionWeight;
-
-              return {
-                startNodeId,
-                endNodeId,
-                roadName,
-                functionalClass,
-                direction,
-                lanes,
-                length,
-                speed,
-                osmTag,
-                flowScore
-              };
-            }).filter(d => d.startNodeId && d.endNodeId);
-            setRoadNetworkData(parsed);
-          }
-        }
-
-        const roadGeoRes = await fetchJsonWithFallback('/api/data/roads', '/api/data/roads.json');
-        if (roadGeoRes.ok) {
-          const roadGeoJson = await roadGeoRes.json();
-          if (Array.isArray(roadGeoJson?.features) && roadGeoJson.features.length > 0) {
-            setRoadGeoData({
-              type: 'FeatureCollection',
-              features: roadGeoJson.features
-            });
-          }
-        }
-      } catch (error) {
-        console.error('Error loading grid metrics:', error);
+        const response = await fetch(url);
+        if (!response.ok) return '';
+        return response.text();
+      } catch {
+        return '';
       }
     };
-    fetchGridMetrics();
+
+    const load = async () => {
+      try {
+        const attractionCategories: FactorBusinessCategory[] = ['ACGN', 'Auto', 'F&B', 'Public', 'Star', 'Lifestyle', 'Beauty', 'Culture&Art'];
+
+        const [xuhuiGridResp, dxjhGridResp, poiCsvText, xhBoundaryResp, dxjhBoundaryResp, houseCsv, streetCsv, dxjhMetricsCsv, importanceCsvList, attractionCsvList, timeWeightsResp] = await Promise.all([
+          fetchJsonSafe('/api/data/xuhui-grid'),
+          fetchJsonSafe('/api/data/dxjh-grid'),
+          fetchTextSafe('/api/data/poi'),
+          fetchJsonSafe('/api/data/xuhui-boundary'),
+          fetchJsonSafe('/api/data/dxjh-boundary'),
+          fetchTextSafe('/api/data/house-price'),
+          fetchTextSafe('/api/data/street-view'),
+          fetchTextSafe('/api/data/dxjh-metrics'),
+          Promise.all(FACTOR_CATEGORIES.map((item) => fetchTextSafe(`/api/data/importance/${encodeURIComponent(item)}`))),
+          Promise.all(attractionCategories.map((item) => fetchTextSafe(`/api/data/attraction/${encodeURIComponent(item)}`))),
+          fetchJsonSafe('/api/data/time-weights'),
+        ]);
+
+        const xuhuiGridRaw = xuhuiGridResp || dxjhGridResp;
+        const dxjhGridRaw = dxjhGridResp || xuhuiGridResp;
+        const xhBoundaryRaw = xhBoundaryResp || dxjhBoundaryResp;
+        const dxjhBoundaryRaw = dxjhBoundaryResp || xhBoundaryResp;
+
+        if (!xuhuiGridRaw && !dxjhGridRaw) {
+          throw new Error('grid data unavailable');
+        }
+
+        const xuhuiGridLonLat = ensureLonLatGeoJSON(xuhuiGridRaw || dxjhGridRaw);
+        const xuhuiGridCorrected = correctGeoJSON(xuhuiGridLonLat);
+
+        const poiRaw = parsePoiRows(poiCsvText);
+        const poiCorrected = correctPoiCentroids(poiRaw);
+
+        const candidates = [
+          { key: 'raw_raw', grid: xuhuiGridLonLat, poi: poiRaw },
+          { key: 'corr_raw', grid: xuhuiGridCorrected, poi: poiRaw },
+          { key: 'raw_corr', grid: xuhuiGridLonLat, poi: poiCorrected },
+          { key: 'corr_corr', grid: xuhuiGridCorrected, poi: poiCorrected },
+        ];
+
+        const scored = candidates.map((item) => ({
+          ...item,
+          score: geoPoiAlignmentScore(item.grid, item.poi),
+        }));
+
+        scored.sort((a, b) => a.score - b.score);
+        const best = scored[0];
+
+        const useCorrectedGrid = best.key.startsWith('corr_');
+        const xuhuiGridGeo = useCorrectedGrid ? xuhuiGridCorrected : xuhuiGridLonLat;
+        const dxjhGridLonLat = ensureLonLatGeoJSON(dxjhGridRaw || xuhuiGridRaw);
+        const dxjhGridGeo = useCorrectedGrid ? correctGeoJSON(dxjhGridLonLat) : dxjhGridLonLat;
+        let poiById = best.poi;
+
+        const offset = estimatePoiOffset(xuhuiGridGeo, poiById);
+        const offsetDistance = Math.sqrt(offset.dx * offset.dx + offset.dy * offset.dy);
+        if (offset.count > 0 && offsetDistance > 0.00004) {
+          poiById = applyPoiOffset(poiById, offset.dx, offset.dy);
+          console.info('[coord-detect] apply poi offset', offset);
+        }
+
+        const mappedXuhui = buildGridData(xuhuiGridGeo, poiById);
+        const mappedDxjh = buildGridData(dxjhGridGeo, poiById);
+
+        const xhBoundary = xhBoundaryRaw ? pickAlignedBoundary(xhBoundaryRaw, mappedXuhui) : null;
+        let dxBoundary = dxjhBoundaryRaw ? pickAlignedBoundary(dxjhBoundaryRaw, mappedDxjh, false) : null;
+
+        const boundaryOffset = estimateBoundaryCenterOffset(dxBoundary, mappedDxjh);
+        const boundaryOffsetDistance = Math.sqrt(boundaryOffset.dx * boundaryOffset.dx + boundaryOffset.dy * boundaryOffset.dy);
+        if (boundaryOffset.count > 0 && boundaryOffsetDistance > 0.00003 && boundaryOffsetDistance < 0.01) {
+          const optimized = optimizeBoundaryOffsetByCoverage(dxBoundary, mappedDxjh, boundaryOffset.dx, boundaryOffset.dy);
+          dxBoundary = shiftFeatureCollection(dxBoundary, optimized.dx, optimized.dy);
+          console.info('[coord-detect] apply dxjh boundary offset', { ...boundaryOffset, optimized });
+        }
+
+        console.info('[coord-detect] selected mode:', best.key, 'score:', best.score);
+
+        setXuhuiGridData(mappedXuhui);
+        setDxjhGridData(mappedDxjh);
+        setXuhuiBoundary(xhBoundary);
+        setDxjhBoundary(dxBoundary);
+        setHousePriceRows(houseCsv ? (d3.csvParse(houseCsv) as GridMetricRow[]) : []);
+        setStreetViewRows(streetCsv ? (d3.csvParse(streetCsv) as GridMetricRow[]) : []);
+        setDxjhMetricRows(dxjhMetricsCsv ? (d3.csvParse(dxjhMetricsCsv) as GridMetricRow[]) : []);
+        const nextImportance = FACTOR_CATEGORIES.reduce((acc, category, index) => {
+          acc[category] = parseImportanceCsv(importanceCsvList[index] || '');
+          return acc;
+        }, { ...EMPTY_IMPORTANCE } as ImportanceWeightsByCategory);
+
+        const nextAttraction = attractionCategories.reduce((acc, category, index) => {
+          acc[category] = parseAttractionCsv(attractionCsvList[index] || '');
+          return acc;
+        }, { ...EMPTY_ATTRACTION } as AttractionBaselineByCategory);
+        nextAttraction.Overall = buildOverallAttraction(nextAttraction);
+
+        setImportanceByCategory(nextImportance);
+        setAttractionByCategory(nextAttraction);
+        setTemporalWeights(timeWeightsResp || null);
+        setConfig((prev) => {
+          const currentMap = nextImportance[prev.flowBusinessCategory] || {};
+          const topFactor = Object.entries(currentMap).sort((a, b) => Number(b[1]) - Number(a[1]))[0]?.[0] || '';
+          return {
+            ...prev,
+            flowSelectedFactor: prev.flowSelectedFactor || topFactor,
+            simulationStep: Math.min(prev.simulationStep, Math.max(1, Math.min(SIMULATION_DURATION_MAX_DAYS, Math.round(prev.flowDurationDays || 1)))),
+          };
+        });
+      } catch (error) {
+        console.error('Data load failed', error);
+      }
+    };
+
+    load();
   }, []);
 
-  const updateGridPOI = (id: string, category: string, value: number) => {
-    setGridData(prev => prev.map(cell => {
-      if (cell.id === id) {
-        return {
-          ...cell,
-          pois: { ...cell.pois, [category]: value }
-        };
-      }
-      return cell;
-    }));
-    if (selectedGrid && selectedGrid.id === id) {
-      setSelectedGrid(prev => prev ? {
-        ...prev,
-        pois: { ...prev.pois, [category]: value }
-      } : null);
+  const selectedGridSummary = useMemo(() => {
+    if (!selectedGrid) return null;
+    const sorted = Object.entries(selectedGrid.pois)
+      .sort((a, b) => Number(b[1]) - Number(a[1]))
+      .slice(0, 5)
+      .map(([key, value]) => ({
+        key,
+        label: POI_LABELS[key] || key,
+        value,
+      }));
+    return sorted;
+  }, [selectedGrid]);
+
+  const handleExportPng = async () => {
+    const target = document.getElementById('analysis-map-container');
+    if (!target) return;
+
+    setIsExporting(true);
+    try {
+      const canvas = await domToCanvas(target, {
+        scale: 2,
+        backgroundColor: '#ffffff',
+      });
+      const link = document.createElement('a');
+      link.download = `xuhui-analysis-${viewMode}-${Date.now()}.png`;
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    } catch (error) {
+      console.error('PNG 导出失败', error);
+    } finally {
+      setIsExporting(false);
     }
   };
 
-  useEffect(() => {
-    (window as any).currentGridData = gridData;
-    (window as any).activityGridData = activityGridData;
-    (window as any).housePriceGridMetrics = housePriceGridMetrics;
-    (window as any).streetViewGridMetrics = streetViewGridMetrics;
-  }, [gridData, activityGridData, housePriceGridMetrics, streetViewGridMetrics]);
-
   return (
-    <div className="flex h-screen bg-slate-50 font-sans text-slate-900 overflow-hidden">
-      {/* Sidebar / Controls */}
-      <Controls 
-        config={config} 
-        setConfig={setConfig}
+    <div className="h-screen w-screen overflow-hidden bg-gradient-to-br from-slate-100 via-slate-50 to-indigo-50 text-slate-900 flex">
+      <Controls
         viewMode={viewMode}
         setViewMode={setViewMode}
-        locationAreaMode={locationAreaMode}
-        setLocationAreaMode={setLocationAreaMode}
-        restrictToBoundary={restrictToBoundary}
-        setRestrictToBoundary={setRestrictToBoundary}
+        config={config}
+        setConfig={setConfig}
+        onExportPng={handleExportPng}
+        isExporting={isExporting}
+        importanceByCategory={importanceByCategory}
+        temporalWeights={temporalWeights}
       />
 
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col relative">
-        {config.isSimulationActive && (
-          <div className="absolute top-20 left-1/2 -translate-x-1/2 z-20 px-4 py-2 bg-amber-500 text-white rounded-full shadow-lg font-bold text-xs flex items-center gap-2 animate-pulse">
-            <Zap className="w-4 h-4" />
-            特殊事件模拟中: {config.simulationStep * 10}%
-          </div>
-        )}
-        {/* Header */}
-        <header className="h-16 border-b border-slate-200 bg-white flex items-center justify-between px-8 z-10 shadow-sm">
+      <main className="flex-1 flex flex-col min-w-0">
+        <header className="h-16 px-5 border-b border-slate-200 bg-white/90 backdrop-blur flex items-center justify-between shadow-sm">
           <div className="flex items-center gap-3">
-            <div className="p-2 bg-indigo-600 rounded-xl text-white shadow-lg shadow-indigo-200">
-              <MapIcon className="w-6 h-6" />
+            <div className="h-9 w-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center shadow-lg shadow-indigo-200">
+              <MapIcon className="w-5 h-5" />
             </div>
             <div>
-              <h1 className="font-bold text-lg tracking-tight text-slate-900">徐汇区分析模拟平台</h1>
-              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-[0.2em]">Xuhui Urban Dynamics Simulation</p>
+              <h1 className="text-sm font-bold">徐汇 / 大徐家汇 网格分析平台</h1>
+              <p className="text-xs text-slate-500">当前模式：{modeLabels[viewMode]}（范围：{usingDxjhBoundary ? '大徐家汇' : '徐汇'}）</p>
             </div>
           </div>
-          
-          <div className="flex items-center gap-4">
-            <div className={`flex items-center gap-2 px-4 py-2 rounded-full text-[10px] font-bold uppercase tracking-wider border ${gridData.length > 0 ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : 'bg-amber-50 text-amber-600 border-amber-100'}`}>
-              <span className="relative flex h-2 w-2">
-                <span className={`${gridData.length > 0 ? 'animate-ping' : ''} absolute inline-flex h-full w-full rounded-full ${gridData.length > 0 ? 'bg-emerald-400' : 'bg-amber-400'} opacity-75`}></span>
-                <span className={`relative inline-flex rounded-full h-2 w-2 ${gridData.length > 0 ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
-              </span>
-              {gridData.length > 0 ? `模拟环境已就绪 (${gridData.length} 个单元)` : '正在加载空间数据...'}
-            </div>
+
+          <div className="text-xs text-slate-500">
+            网格数量：{activeGridData.length} | 事件数：{config.events.length}
           </div>
         </header>
 
-        {/* Map Area */}
-        <div id="analysis-map-container" className="flex-1 relative min-h-0 flex flex-col bg-white">
-          <GridMap 
-            data={gridData} 
-            config={config} 
-            boundary={boundary}
-            mergedArea={mergedArea}
-            restrictToBoundary={restrictToBoundary}
-            roadNetworkData={roadNetworkData}
-            roadGeoData={roadGeoData || undefined}
-            housePriceGridMetrics={alignedHousePriceMetrics}
-            streetViewGridMetrics={alignedStreetViewMetrics}
-            activityGridData={alignedActivityData}
-            onGridClick={handleGridClick}
+        <div id="analysis-map-container" className="flex-1 min-h-0 relative p-2">
+          <AnalysisMap
+            data={activeGridData}
+            scopeBoundary={activeBoundary}
+            config={config}
             viewMode={viewMode}
-            locationAreaMode={locationAreaMode}
             selectedGridId={selectedGrid?.id}
+            onGridClick={(grid) => {
+              if (viewMode === 'flow_prediction') {
+                setConfig((prev) => {
+                  const existed = prev.flowSelectedGridIds.includes(grid.id);
+                  return {
+                    ...prev,
+                    flowSelectedGridIds: existed
+                      ? prev.flowSelectedGridIds.filter((id) => id !== grid.id)
+                      : [...prev.flowSelectedGridIds, grid.id],
+                  };
+                });
+                setSelectedGrid(grid);
+                return;
+              }
+              setSelectedGrid((prev) => (prev?.id === grid.id ? null : grid));
+            }}
+            housePriceRows={housePriceRows}
+            streetViewRows={streetViewRows}
+            dxjhMetricRows={dxjhMetricRows}
+            importanceByCategory={importanceByCategory}
+            attractionByCategory={attractionByCategory}
+            temporalWeights={temporalWeights}
           />
 
-          {/* Info Overlay */}
           {selectedGrid && (
-            <motion.div 
-              initial={{ opacity: 0, x: 20 }}
+            <motion.div
+              initial={{ opacity: 0, x: 24 }}
               animate={{ opacity: 1, x: 0 }}
-              className="absolute top-4 right-4 w-72 bg-white/95 backdrop-blur-xl p-4 rounded-3xl shadow-2xl border border-white/20 z-30 max-h-[70vh] overflow-y-auto"
+              className="absolute right-4 top-4 w-72 rounded-3xl bg-white/95 backdrop-blur-xl p-4 border border-white/40 shadow-2xl z-[1200]"
             >
-              <div className="flex justify-between items-start mb-6 sticky top-0 bg-white/50 backdrop-blur-sm py-2 z-10">
+              <div className="flex items-start justify-between mb-4">
                 <div>
-                  <h3 className="font-bold text-slate-900 text-lg">网格统计分析</h3>
-                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">单元 ID: {selectedGrid.id}</p>
+                  <h3 className="text-base font-bold text-slate-900">网格统计分析</h3>
+                  <p className="text-[10px] font-bold text-slate-400 tracking-widest uppercase">单元 ID: {selectedGrid.id}</p>
                 </div>
-                <button 
+                <button
+                  className="text-xs text-slate-500 px-2 py-1 rounded-lg hover:bg-slate-100"
                   onClick={() => setSelectedGrid(null)}
-                  className="p-1.5 hover:bg-slate-100 rounded-full transition-colors"
                 >
-                  <Info className="w-4 h-4 text-slate-400" />
+                  关闭
                 </button>
               </div>
-              
-              <div className="space-y-6">
-                <div className="flex justify-between items-end">
-                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">网格编号</span>
-                  <span className="font-mono text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-1 rounded-lg">
-                    {selectedGrid.id}
-                  </span>
-                </div>
 
-                <div className="space-y-4">
-                  <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100 pb-2">POI 数量手动调节</h4>
-                  <div className="grid grid-cols-1 gap-2">
-                    {(() => {
-                      let displayPois: [string, number][] = [];
-                      const allPois = Object.entries(selectedGrid.pois) as [string, number][];
-                      
-                      if (viewMode === 'heat') {
-                        if (config.heatSubMode === 'simulation') {
-                          displayPois = allPois;
-                        } else if (config.heatSubMode === 'multi') {
-                          displayPois = allPois.filter(([key]) => config.multiFactorCategories?.includes(key as keyof POICategories));
-                        } else {
-                          displayPois = [[config.singleFactorCategory || 'CYMS', selectedGrid.pois[(config.singleFactorCategory || 'CYMS') as keyof POICategories]]];
-                        }
-                      } else if (viewMode === 'kde') {
-                        displayPois = allPois.filter(([key]) => config.kdeCategories?.includes(key as keyof POICategories));
-                      } else if (viewMode === 'flow_analysis') {
-                        if (config.flowSubMode === 'custom_formula') {
-                          displayPois = allPois.filter(([key]) => config.flowCategories?.includes(key as keyof POICategories));
-                        } else {
-                          displayPois = allPois.filter(([key]) => config.aggregationCategories?.includes(key as keyof POICategories));
-                        }
-                      } else if (viewMode === 'spatial_autocorrelation') {
-                        if (config.spatialSubMode === 'moran') {
-                          displayPois = allPois.filter(([key]) => config.moranCategories?.includes(key as keyof POICategories));
-                        } else {
-                          displayPois = allPois.filter(([key]) => config.lisaCategories?.includes(key as keyof POICategories));
-                        }
-                      } else if (viewMode === 'entropy') {
-                        displayPois = allPois.filter(([key]) => config.entropyCategories?.includes(key as keyof POICategories));
-                      } else if (viewMode === 'dbscan') {
-                        displayPois = allPois.filter(([key]) => config.dbscanCategories?.includes(key as keyof POICategories));
-                      } else if (viewMode === 'house_price') {
-                        const idx = gridData.findIndex(g => g.id === selectedGrid.id);
-                        const metrics = alignedHousePriceMetrics[idx];
-                        if (!metrics) return <p className="text-[9px] text-slate-400 italic">暂无房价指标数据</p>;
-                        const hpPrice = pickMetricValue(metrics, ['小区均价', 'house_price', 'avg_price', 'price'], 0);
-                        const hpArea = pickMetricValue(metrics, ['总建面', 'total_area', 'area'], 0);
-                        const hpPlotRatio = pickMetricValue(metrics, ['容积率', 'plot_ratio', 'far'], 0);
-                        const hpGreenRatio = pickMetricValue(metrics, ['绿化率', 'green_ratio'], 0);
-                        return (
-                          <div className="p-3 bg-emerald-50 rounded-2xl border border-emerald-100 space-y-2">
-                            <p className="text-[10px] font-bold text-emerald-600 uppercase">房价分析指标</p>
-                            <div className="space-y-1">
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">小区均价:</span>
-                                <span className="font-bold text-emerald-700">{hpPrice || '0'} 元/㎡</span>
-                              </div>
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">总建面:</span>
-                                <span className="font-bold text-emerald-700">{hpArea || '0'} ㎡</span>
-                              </div>
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">容积率:</span>
-                                <span className="font-bold text-emerald-700">{hpPlotRatio || '0'}</span>
-                              </div>
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">绿化率:</span>
-                                <span className="font-bold text-emerald-700">{hpGreenRatio || '0'}%</span>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      } else if (viewMode === 'street_view') {
-                        const idx = gridData.findIndex(g => g.id === selectedGrid.id);
-                        const metrics = alignedStreetViewMetrics[idx];
-                        if (!metrics) return <p className="text-[9px] text-slate-400 italic">暂无街景指标数据</p>;
-                        return (
-                          <div className="p-3 bg-cyan-50 rounded-2xl border border-cyan-100 space-y-2">
-                            <p className="text-[10px] font-bold text-cyan-600 uppercase">街景语义指标</p>
-                            <div className="space-y-1">
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">绿视率:</span>
-                                <span className="font-bold text-cyan-700">{(parseFloat(metrics.green_view || 0) * 100).toFixed(1)}%</span>
-                              </div>
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">天空开敞度:</span>
-                                <span className="font-bold text-cyan-700">{(parseFloat(metrics.sky_view || 0) * 100).toFixed(1)}%</span>
-                              </div>
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">界面连续度:</span>
-                                <span className="font-bold text-cyan-700">{(parseFloat(metrics.interface_continuity || 0) * 100).toFixed(1)}%</span>
-                              </div>
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">步行适宜度:</span>
-                                <span className="font-bold text-cyan-700">{(parseFloat(metrics.walkability || 0) * 100).toFixed(1)}%</span>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      } else if (viewMode === 'activity_analysis') {
-                        const idx = gridData.findIndex(g => g.id === selectedGrid.id);
-                        const metrics = alignedActivityData[idx];
-                        if (!metrics) return <p className="text-[9px] text-slate-400 italic">暂无活动指标数据</p>;
-                        const activityCount = pickMetricValue(metrics, ['activity_count', 'activity_account', 'activity'], 0);
-                        return (
-                          <div className="p-3 bg-rose-50 rounded-2xl border border-rose-100 space-y-2">
-                            <p className="text-[10px] font-bold text-rose-600 uppercase">城市活动指标</p>
-                            <div className="space-y-1">
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">活动强度 (Count):</span>
-                                <span className="font-bold text-rose-700">{activityCount || '0'}</span>
-                              </div>
-                              <p className="text-[9px] text-slate-400 italic mt-2">
-                                数据来源于 Xuhui_activity_grid.csv，反映该网格内的历史活动频次。
-                              </p>
-                            </div>
-                          </div>
-                        );
-                      } else if (viewMode === 'traffic_analysis') {
-                        const idx = gridData.indexOf(selectedGrid);
-                        if (idx < 0) return <p className="text-[9px] text-slate-400 italic">未找到网格索引</p>;
-
-                        // Recompute traffic heat values for current data + road network (fast enough for single read)
-                        const trafficValues = calculateTrafficHeat(gridData, roadNetworkData || []);
-                        const trafficValue = trafficValues[idx] || 0;
-                        const streetMetrics = alignedStreetViewMetrics[idx] || {};
-
-                        return (
-                          <div className="p-3 bg-indigo-50 rounded-2xl border border-indigo-100 space-y-2">
-                            <p className="text-[10px] font-bold text-indigo-600 uppercase">交通网格指标</p>
-                            <div className="space-y-1">
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">交通设施强度 (JTSS):</span>
-                                <span className="font-bold text-indigo-700">{selectedGrid.pois.JTSS || 0}</span>
-                              </div>
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">交通热力值:</span>
-                                <span className="font-bold text-indigo-700">{trafficValue.toFixed(3)}</span>
-                              </div>
-                              <div className="flex justify-between text-[9px]">
-                                <span className="text-slate-500">街景交通压力:</span>
-                                <span className="font-bold text-indigo-700">{(parseFloat(streetMetrics.traffic_pressure || '0')).toFixed(2)}</span>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      } else if (viewMode === 'region_selection') {
-                        const idx = gridData.findIndex(g => g.id === selectedGrid.id);
-                        if (idx < 0) return <p className="text-[9px] text-slate-400 italic">未找到网格索引</p>;
-
-                        const thresholdPct = config.regionSelectionThreshold ?? 52;
-                        const threshold = thresholdPct / 100;
-                        const minRatio = config.regionSelectionMinRatio ?? 0.01;
-                        const { values: regionValues, idealRanges } = calculateRegionSelection(
-                          gridData,
-                          alignedActivityData,
-                          alignedHousePriceMetrics,
-                          alignedStreetViewMetrics,
-                          threshold
-                        );
-
-                        const sorted = [...regionValues].sort((a, b) => a - b);
-                        const minCount = Math.max(1, Math.ceil(regionValues.length * Math.max(0.01, Math.min(0.95, minRatio))));
-                        const selectedCount = regionValues.filter(v => v >= threshold).length;
-                        const rankIdx = Math.max(0, sorted.length - minCount);
-                        const ratioThreshold = Number(sorted[rankIdx] ?? threshold);
-                        const effectiveThreshold = selectedCount >= minCount ? threshold : Math.min(threshold, ratioThreshold);
-
-                        const houseMetrics = alignedHousePriceMetrics[idx] || {};
-                        const streetMetrics = alignedStreetViewMetrics[idx] || {};
-                        const activityMetrics = alignedActivityData[idx] || {};
-                        const currentValues: Record<string, number> = {
-                          poi_density: d3.sum(Object.values(selectedGrid.pois)),
-                          traffic_poi: selectedGrid.pois.JTSS || 0,
-                          traffic_pressure: parseFloat(streetMetrics.traffic_pressure || 'NaN'),
-                          green_view: parseFloat(streetMetrics.green_view || 'NaN'),
-                          sky_view: parseFloat(streetMetrics.sky_view || 'NaN'),
-                          continuity: parseFloat(streetMetrics.interface_continuity || 'NaN'),
-                          walkability: parseFloat(streetMetrics.walkability || 'NaN'),
-                          house_price: pickMetricValue(houseMetrics, ['小区均价', 'house_price', 'avg_price', 'price'], NaN)
-                        };
-
-                        const labelMap: Record<string, string> = {
-                          poi_density: 'POI 密度',
-                          traffic_poi: '交通设施强度',
-                          traffic_pressure: '交通压力',
-                          green_view: '绿视率',
-                          sky_view: '天空开敞度',
-                          continuity: '界面连续度',
-                          walkability: '步行适宜度',
-                          house_price: '房价水平'
-                        };
-
-                        const score = regionValues[idx] || 0;
-                        const isSelected = score >= effectiveThreshold;
-
-                        return (
-                          <div className="p-3 bg-red-50 rounded-2xl border border-red-100 space-y-2">
-                            <p className="text-[10px] font-bold text-red-600 uppercase">区域选择指标详情</p>
-                            <div className="flex justify-between text-[9px]">
-                              <span className="text-slate-500">匹配得分:</span>
-                              <span className="font-bold text-red-700">{(score * 100).toFixed(1)}%</span>
-                            </div>
-                            <div className="flex justify-between text-[9px]">
-                              <span className="text-slate-500">生效阈值:</span>
-                              <span className="font-bold text-red-700">{(effectiveThreshold * 100).toFixed(1)}%</span>
-                            </div>
-                            <div className="flex justify-between text-[9px]">
-                              <span className="text-slate-500">是否选中:</span>
-                              <span className={`font-bold ${isSelected ? 'text-red-700' : 'text-slate-500'}`}>{isSelected ? '是' : '否'}</span>
-                            </div>
-                            <div className="pt-2 border-t border-red-100 space-y-1">
-                              {Object.entries(idealRanges).map(([key, range]: [string, any]) => {
-                                const value = currentValues[key];
-                                const hasValue = Number.isFinite(value);
-                                const inRange = hasValue && value >= range.min && value <= range.max;
-                                return (
-                                  <div key={key} className="flex justify-between text-[9px]">
-                                    <span className="text-slate-500">{labelMap[key] || key}:</span>
-                                    <span className={`font-bold ${inRange ? 'text-red-700' : 'text-slate-600'}`}>
-                                      {hasValue ? value.toFixed(2) : 'NA'} / [{range.min.toFixed(2)}-{range.max.toFixed(2)}]
-                                    </span>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                            <div className="text-[9px] text-slate-400 italic">activity: {pickMetricValue(activityMetrics, ['activity_count', 'activity_account', 'activity'], 0)}</div>
-                          </div>
-                        );
-                      }
-                      
-                      return displayPois.map(([key, val]) => (
-                        <div 
-                          key={key} 
-                          className={`p-2 rounded-xl border transition-all ${viewMode === key ? 'bg-indigo-50 border-indigo-200 ring-2 ring-indigo-100' : 'bg-slate-50 border-slate-100'}`}
-                        >
-                          <p className={`text-[9px] uppercase font-bold tracking-wider mb-1 ${viewMode === key ? 'text-indigo-600' : 'text-slate-400'}`}>
-                            {POI_LABELS[key] || key}
-                            {viewMode === key && ' (当前视图)'}
-                          </p>
-                          <input
-                            type="number"
-                            value={val}
-                            onChange={(e) => updateGridPOI(selectedGrid.id, key, parseFloat(e.target.value) || 0)}
-                            className="bg-transparent font-mono text-sm font-bold text-slate-700 w-full focus:outline-none focus:ring-1 focus:ring-indigo-500 rounded px-1"
-                          />
-                        </div>
-                      ));
-                    })()}
+              <div className="space-y-2">
+                {selectedGridSummary?.map((item) => (
+                  <div key={item.key} className="flex items-center justify-between rounded-xl bg-slate-50 border border-slate-100 px-3 py-2">
+                    <span className="text-xs font-semibold text-slate-500">{item.label}</span>
+                    <span className="text-sm font-bold text-indigo-700">{Number(item.value).toFixed(0)}</span>
                   </div>
-                </div>
+                ))}
               </div>
             </motion.div>
           )}

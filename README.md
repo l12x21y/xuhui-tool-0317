@@ -22,7 +22,7 @@ This repo is configured to auto-deploy to GitHub Pages when pushing to `main`.
 
 Expected site URL:
 
-`https://l12x21y.github.io/xuhui-grid-heat-simulator/`
+`https://l12x21y.github.io/xuhui-tool-0317/`
 
 Notes:
 

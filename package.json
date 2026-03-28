@@ -9,7 +9,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "run:rf": "python ./scripts/run_rf_by_activity.py --grid ./grid_100m_all.csv --activity ./Xuhui_activity_grid.csv --shp ./merge_shp/merged_area84.shp --outdir ./public/api/rf_outputs"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

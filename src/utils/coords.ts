@@ -103,3 +103,60 @@ export function correctGeoJSON(geojson: any): any {
   }
   return geojson;
 }
+
+// Convert Web-Mercator (EPSG:3857) meters -> lon/lat for a single point
+function webMercatorToLonLat(x: number, y: number): [number, number] {
+  const RADIUS = 20037508.34; // half circumference in meters
+  const lon = (x / RADIUS) * 180.0;
+  let lat = (y / RADIUS) * 180.0;
+  lat = 180 / Math.PI * (2 * Math.atan(Math.exp(lat * Math.PI / 180.0)) - Math.PI / 2);
+  return [lon, lat];
+}
+
+// Ensure GeoJSON coordinates are in lon/lat. If coordinates look projected (large magnitude), convert from Web-Mercator.
+export function ensureLonLatGeoJSON(geojson: any): any {
+  if (!geojson) return geojson;
+
+  const processCoords = (coords: any): any => {
+    if (!Array.isArray(coords)) return coords;
+
+    if (coords.length >= 2 && typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+      const x = coords[0];
+      const y = coords[1];
+      // Heuristic: if coordinates are outside lon/lat ranges, treat as Web-Mercator meters
+      if (Math.abs(x) > 180 || Math.abs(y) > 90) {
+        return webMercatorToLonLat(x, y);
+      }
+      return coords;
+    }
+
+    return coords.map(processCoords);
+  };
+
+  if (geojson.type === 'FeatureCollection') {
+    return {
+      ...geojson,
+      features: geojson.features.map((f: any) => ({
+        ...f,
+        geometry: f.geometry ? {
+          ...f.geometry,
+          coordinates: processCoords(f.geometry.coordinates)
+        } : null
+      }))
+    };
+  } else if (geojson.type === 'Feature') {
+    return {
+      ...geojson,
+      geometry: geojson.geometry ? {
+        ...geojson.geometry,
+        coordinates: processCoords(geojson.geometry.coordinates)
+      } : null
+    };
+  } else if (geojson.coordinates) {
+    return {
+      ...geojson,
+      coordinates: processCoords(geojson.coordinates)
+    };
+  }
+  return geojson;
+}

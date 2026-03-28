@@ -9,3 +9,15 @@
 body {
   @apply antialiased;
 }
+
+button {
+  transition: transform 0.18s ease, box-shadow 0.18s ease, background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+}
+
+button:active {
+  transform: translateY(0.5px);
+}
+
+input[type='range'] {
+  accent-color: #0ea5e9;
+}
